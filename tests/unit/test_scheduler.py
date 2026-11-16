@@ -407,10 +407,10 @@ def test_watermark_applies_to_admission_not_to_decode() -> None:
     assert sim.sched.watermark_blocks == 2
     sim.add(make_seq(0, 28, max_tokens=4))  # 7 blocks -> 3 free
     sim.add(make_seq(1, 4, max_tokens=1))  # 1 block -> 2 free (== watermark, allowed)
-    sim.add(make_seq(2, 4, max_tokens=2))  # would leave 1 < 2: must wait
+    sim.add(make_seq(2, 4, max_tokens=3))  # would leave 1 < 2: must wait
     out, _ = sim.step()
     assert [e.seq_id for e in out.entries] == [0, 1]
-    assert sim.bm.num_free_blocks == 2
+    assert sim.bm.num_free_blocks == 3
     # Seq 1 finished (max_tokens 1) -> 3 free. Seq 2 now fits: 3 - 1 = 2.
     out, _ = sim.step()
     assert [e.seq_id for e in out.entries] == [2]

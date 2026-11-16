@@ -41,12 +41,13 @@ No torch import here.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from stallfree.block_manager import BlockManager
 from stallfree.config import SchedulerConfig
-from stallfree.sequence import SamplingParams, Sequence
+from stallfree.sequence import FinishReason, SamplingParams, Sequence, SequenceStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,43 +111,56 @@ class Scheduler:
         NotImplementedError: if ``config.enable_mixed_batching`` is true (not implemented yet).
 
     ``watermark_blocks = int(config.watermark * block_manager.num_blocks)``.
+
+    State:
+        ``_waiting``: FIFO of sequences holding no blocks (new, or preempted at the front).
+        ``_running``: sequences holding blocks, in admission order (oldest first). The end of the
+            list is the newest, which is where preemption victims come from.
+        ``_seqs``: every waiting or running sequence by id.
     """
 
     def __init__(self, config: SchedulerConfig, block_manager: BlockManager) -> None:
-        raise NotImplementedError
+        if config.enable_mixed_batching:
+            raise NotImplementedError("mixed batching is not implemented yet")
+        self._config = config
+        self._bm = block_manager
+        self._watermark_blocks = int(config.watermark * block_manager.num_blocks)
+        self._waiting: deque[Sequence] = deque()
+        self._running: list[Sequence] = []
+        self._seqs: dict[int, Sequence] = {}
 
     @property
     def num_waiting(self) -> int:
         """Sequences in the waiting queue (new or preempted)."""
-        raise NotImplementedError
+        return len(self._waiting)
 
     @property
     def num_running(self) -> int:
         """Sequences holding KV cache blocks."""
-        raise NotImplementedError
+        return len(self._running)
 
     @property
     def waiting_seq_ids(self) -> tuple[int, ...]:
         """Ids in the waiting queue, front first."""
-        raise NotImplementedError
+        return tuple(seq.seq_id for seq in self._waiting)
 
     @property
     def running_seq_ids(self) -> tuple[int, ...]:
         """Ids in the running queue, in admission order (oldest first)."""
-        raise NotImplementedError
+        return tuple(seq.seq_id for seq in self._running)
 
     @property
     def watermark_blocks(self) -> int:
         """Blocks that must stay free after admitting a prefill."""
-        raise NotImplementedError
+        return self._watermark_blocks
 
     def has_unfinished(self) -> bool:
         """Whether any sequence is waiting or running."""
-        raise NotImplementedError
+        return bool(self._seqs)
 
     def get(self, seq_id: int) -> Sequence | None:
         """The waiting or running sequence with this id, or None."""
-        raise NotImplementedError
+        return self._seqs.get(seq_id)
 
     def add(self, seq: Sequence) -> None:
         """Append a new request to the end of the waiting queue.
@@ -157,7 +171,30 @@ class Scheduler:
                 ``num_prompt_tokens + max_tokens > max_model_len``; or if that many tokens need
                 more blocks than ``num_blocks - watermark_blocks`` (it could never run alone).
         """
-        raise NotImplementedError
+        if (
+            seq.status is not SequenceStatus.WAITING
+            or seq.num_computed_tokens != 0
+            or seq.num_output_tokens != 0
+        ):
+            raise ValueError(f"{seq!r} is not a fresh request")
+        if seq.seq_id in self._seqs:
+            raise ValueError(f"seq_id {seq.seq_id} is already waiting or running")
+        max_len = seq.num_prompt_tokens + seq.sampling_params.max_tokens
+        if max_len > self._config.max_model_len:
+            raise ValueError(
+                f"prompt ({seq.num_prompt_tokens}) + max_tokens "
+                f"({seq.sampling_params.max_tokens}) exceeds max_model_len "
+                f"({self._config.max_model_len})"
+            )
+        # Conservative by one token: the last sampled token never needs a KV slot.
+        usable = self._bm.num_blocks - self._watermark_blocks
+        if self._bm.blocks_needed(seq.seq_id, max_len) > usable:
+            raise ValueError(
+                f"request needs up to {max_len} tokens of KV cache, more than the "
+                f"{usable * self._bm.block_size} available to one request"
+            )
+        self._waiting.append(seq)
+        self._seqs[seq.seq_id] = seq
 
     def abort(self, seq_id: int) -> Sequence | None:
         """Cancel a waiting or running sequence.
@@ -167,7 +204,17 @@ class Scheduler:
         (already finished or unknown); that is not an error, because a client may disconnect
         after its request finished.
         """
-        raise NotImplementedError
+        seq = self._seqs.pop(seq_id, None)
+        if seq is None:
+            return None
+        if seq.status is SequenceStatus.RUNNING:
+            self._running.remove(seq)
+            self._bm.free(seq_id)
+        else:
+            self._waiting.remove(seq)
+        seq.status = SequenceStatus.FINISHED
+        seq.finish_reason = FinishReason.ABORT
+        return seq
 
     def schedule(self) -> SchedulerOutput:
         """Plan the next step (see the module docstring for the policy).
@@ -180,7 +227,82 @@ class Scheduler:
 
         Returns an empty output when nothing can run (nothing waiting or running).
         """
-        raise NotImplementedError
+        prefills = self._schedule_prefills()
+        if prefills:
+            return SchedulerOutput(entries=tuple(prefills))
+        return self._schedule_decodes()
+
+    def _schedule_prefills(self) -> list[ScheduledSeq]:
+        """Admit waiting sequences in strict FIFO order; empty if the head does not fit."""
+        cfg = self._config
+        entries: list[ScheduledSeq] = []
+        num_batched = 0
+        while self._waiting:
+            seq = self._waiting[0]
+            if len(self._running) >= cfg.max_num_seqs:
+                break
+            num_new = seq.num_uncomputed_tokens  # whole prompt (+ generated, after preemption)
+            # Over budget stops admission, except as the first entry: a long prompt runs alone.
+            if entries and num_batched + num_new > cfg.max_num_batched_tokens:
+                break
+            needed = self._bm.blocks_needed(seq.seq_id, seq.num_tokens)
+            if self._bm.num_free_blocks - needed < self._watermark_blocks:
+                break
+            self._bm.allocate(seq.seq_id, seq.num_tokens)
+            self._waiting.popleft()
+            seq.status = SequenceStatus.RUNNING
+            self._running.append(seq)
+            entries.append(self._make_entry(seq, num_new))
+            num_batched += num_new
+        return entries
+
+    def _schedule_decodes(self) -> SchedulerOutput:
+        """One token for every running sequence, oldest first, preempting newest on shortage."""
+        entries: list[ScheduledSeq] = []
+        preempted: list[int] = []
+        i = 0
+        while i < len(self._running):
+            seq = self._running[i]
+            assert seq.num_uncomputed_tokens == 1, f"{seq!r} is not ready to decode"
+            # The uncomputed token sits at position num_tokens - 1, so the table must cover
+            # num_tokens positions; that needs a new block exactly at a block boundary.
+            while not self._bm.can_allocate(seq.seq_id, seq.num_tokens):
+                # Newest first. Entries 0..i-1 are already in this step and are never touched.
+                # When seq itself is the last one left (no newer victim), it preempts itself.
+                victim = self._running.pop()
+                self._preempt(victim)
+                preempted.append(victim.seq_id)
+                if victim is seq:
+                    break
+            else:
+                self._bm.allocate(seq.seq_id, seq.num_tokens)
+                entries.append(self._make_entry(seq, 1))
+                i += 1
+        return SchedulerOutput(entries=tuple(entries), preempted_seq_ids=tuple(preempted))
+
+    def _preempt(self, seq: Sequence) -> None:
+        """Recompute preemption: drop the cache, keep the tokens, wait at the front.
+
+        Victims are taken newest first, so pushing each one to the front leaves the waiting
+        queue in admission order (oldest preempted first).
+        """
+        self._bm.free(seq.seq_id)
+        seq.status = SequenceStatus.WAITING
+        seq.num_computed_tokens = 0
+        seq.num_preemptions += 1
+        self._waiting.appendleft(seq)
+
+    def _make_entry(self, seq: Sequence, num_new: int) -> ScheduledSeq:
+        start = seq.num_computed_tokens
+        end = start + num_new
+        return ScheduledSeq(
+            seq_id=seq.seq_id,
+            start_pos=start,
+            token_ids=seq.token_ids[start:end],
+            block_table=self._bm.block_table(seq.seq_id),
+            sample=end == seq.num_tokens,
+            sampling_params=seq.sampling_params,
+        )
 
     def update(self, output: SchedulerOutput, sampled: Mapping[int, int]) -> list[Sequence]:
         """Record the result of executing ``output``.
@@ -200,4 +322,32 @@ class Scheduler:
         Raises:
             KeyError: if an entry with ``sample`` has no token in ``sampled``.
         """
-        raise NotImplementedError
+        # Validate before changing anything, so a bad call leaves the state intact.
+        missing = [e.seq_id for e in output.entries if e.sample and e.seq_id not in sampled]
+        if missing:
+            raise KeyError(f"no sampled token for sequences {missing}")
+        eos = self._config.eos_token_id
+        finished: list[Sequence] = []
+        for entry in output.entries:
+            seq = self._seqs[entry.seq_id]
+            seq.num_computed_tokens += entry.num_new_tokens
+            if not entry.sample:
+                continue
+            token = sampled[entry.seq_id]
+            seq.append_token(token)
+            if eos is not None and token == eos and not seq.sampling_params.ignore_eos:
+                reason = FinishReason.STOP
+            elif seq.num_output_tokens >= seq.sampling_params.max_tokens:
+                reason = FinishReason.LENGTH
+            else:
+                continue
+            self._finish(seq, reason)
+            finished.append(seq)
+        return finished
+
+    def _finish(self, seq: Sequence, reason: FinishReason) -> None:
+        seq.status = SequenceStatus.FINISHED
+        seq.finish_reason = reason
+        self._running.remove(seq)
+        self._bm.free(seq.seq_id)
+        del self._seqs[seq.seq_id]
