@@ -34,12 +34,18 @@ No torch import here.
 
 from __future__ import annotations
 
+from collections import deque
+
 
 class OutOfBlocksError(RuntimeError):
     """Raised by ``allocate`` when there are not enough free blocks.
 
     The manager's state is unchanged when this is raised.
     """
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
 
 
 class BlockManager:
@@ -54,34 +60,48 @@ class BlockManager:
         ValueError: if ``num_blocks`` or ``block_size`` is not a positive integer.
 
     A fresh manager has all blocks free and no sequences.
+
+    State:
+        ``_ref_counts[b]``: reference count of block ``b``.
+        ``_free``: ids of the blocks with reference count 0, in the order they will be handed out
+            (taken from the left, returned on the right). A deque makes both ends O(1).
+        ``_tables[seq_id]``: block ids of that sequence in position order.
     """
 
     def __init__(self, num_blocks: int, block_size: int) -> None:
-        raise NotImplementedError
+        if num_blocks < 1:
+            raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
+        if block_size < 1:
+            raise ValueError(f"block_size must be >= 1, got {block_size}")
+        self._num_blocks = num_blocks
+        self._block_size = block_size
+        self._ref_counts: list[int] = [0] * num_blocks
+        self._free: deque[int] = deque(range(num_blocks))
+        self._tables: dict[int, list[int]] = {}
 
     @property
     def num_blocks(self) -> int:
         """Total number of blocks in the pool (constant)."""
-        raise NotImplementedError
+        return self._num_blocks
 
     @property
     def block_size(self) -> int:
         """Tokens per block (constant)."""
-        raise NotImplementedError
+        return self._block_size
 
     @property
     def num_free_blocks(self) -> int:
         """Number of blocks with reference count 0."""
-        raise NotImplementedError
+        return len(self._free)
 
     @property
     def num_used_blocks(self) -> int:
         """Number of blocks with reference count >= 1."""
-        raise NotImplementedError
+        return self._num_blocks - len(self._free)
 
     def has_seq(self, seq_id: int) -> bool:
         """Whether ``seq_id`` currently holds blocks (has a block table)."""
-        raise NotImplementedError
+        return seq_id in self._tables
 
     def blocks_needed(self, seq_id: int, num_tokens: int) -> int:
         """Additional blocks ``seq_id`` needs so that its table covers ``num_tokens`` tokens.
@@ -100,7 +120,10 @@ class BlockManager:
         Raises:
             ValueError: if ``num_tokens < 1``.
         """
-        raise NotImplementedError
+        if num_tokens < 1:
+            raise ValueError(f"num_tokens must be >= 1, got {num_tokens}")
+        held = len(self._tables.get(seq_id, ()))
+        return max(0, _ceil_div(num_tokens, self._block_size) - held)
 
     def can_allocate(self, seq_id: int, num_tokens: int) -> bool:
         """Whether ``allocate(seq_id, num_tokens)`` would succeed right now.
@@ -110,7 +133,7 @@ class BlockManager:
         Raises:
             ValueError: if ``num_tokens < 1``.
         """
-        raise NotImplementedError
+        return self.blocks_needed(seq_id, num_tokens) <= len(self._free)
 
     def allocate(self, seq_id: int, num_tokens: int) -> None:
         """Grow ``seq_id``'s block table so it covers ``num_tokens`` tokens.
@@ -131,7 +154,21 @@ class BlockManager:
             ValueError: if ``num_tokens < 1``.
             OutOfBlocksError: if fewer than ``blocks_needed`` blocks are free.
         """
-        raise NotImplementedError
+        needed = self.blocks_needed(seq_id, num_tokens)  # validates num_tokens
+        if needed > len(self._free):
+            raise OutOfBlocksError(
+                f"seq {seq_id} needs {needed} blocks for {num_tokens} tokens, "
+                f"{len(self._free)} free"
+            )
+        if needed == 0:
+            return  # already covered; only possible for a known sequence (num_tokens >= 1)
+        # The check above guarantees the loop cannot fail halfway, so the call is atomic.
+        table = self._tables.setdefault(seq_id, [])
+        for _ in range(needed):
+            block_id = self._free.popleft()
+            assert self._ref_counts[block_id] == 0, f"free block {block_id} has references"
+            self._ref_counts[block_id] = 1
+            table.append(block_id)
 
     def free(self, seq_id: int) -> None:
         """Release every block held by ``seq_id`` and forget its table.
@@ -140,11 +177,22 @@ class BlockManager:
         to the free pool. Called when a sequence finishes, is aborted, or is preempted
         (recompute preemption frees everything and re-prefills later).
 
+        Blocks are returned last block first. Today this only fixes the reuse order; with prefix
+        caching, the tail of a sequence (least likely to be shared) is then evicted before its
+        head.
+
         Raises:
             KeyError: if ``seq_id`` holds no blocks (unknown, or already freed). A double free is
                 a scheduler bug and must not pass silently.
         """
-        raise NotImplementedError
+        if seq_id not in self._tables:
+            raise KeyError(f"seq {seq_id} holds no blocks (unknown or already freed)")
+        table = self._tables.pop(seq_id)
+        for block_id in reversed(table):
+            assert self._ref_counts[block_id] > 0, f"block {block_id} freed twice"
+            self._ref_counts[block_id] -= 1
+            if self._ref_counts[block_id] == 0:
+                self._free.append(block_id)
 
     def block_table(self, seq_id: int) -> tuple[int, ...]:
         """The block ids of ``seq_id`` in position order, as an immutable snapshot.
@@ -152,7 +200,9 @@ class BlockManager:
         Raises:
             KeyError: if ``seq_id`` holds no blocks.
         """
-        raise NotImplementedError
+        if seq_id not in self._tables:
+            raise KeyError(f"seq {seq_id} holds no blocks")
+        return tuple(self._tables[seq_id])
 
     def ref_count(self, block_id: int) -> int:
         """Reference count of ``block_id`` (0 if free).
@@ -160,4 +210,7 @@ class BlockManager:
         Raises:
             IndexError: if ``block_id`` is not in ``range(num_blocks)``.
         """
-        raise NotImplementedError
+        # Explicit check: a negative index would otherwise wrap around silently.
+        if not 0 <= block_id < self._num_blocks:
+            raise IndexError(f"block_id {block_id} out of range [0, {self._num_blocks})")
+        return self._ref_counts[block_id]
