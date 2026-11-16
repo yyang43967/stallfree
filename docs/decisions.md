@@ -249,3 +249,47 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
 - **Risk noted in the methodology:** stallfree runs its API and engine loop in one Python process,
   while vLLM separates the API server from the engine core. CPU contention inside stallfree's
   process is part of what is measured and will be discussed as a source of any gap.
+
+## Phase 1a — CPU engine
+
+### Block manager interface
+- **Context:** The block manager has to serve three callers with different needs: admission of a
+  new prompt, growth by one prefill chunk, and growth by one decode token. It also has to be
+  testable without tensors.
+- **Options considered:**
+  1. Block tables stored on the sequence object and mutated by the block manager (nano-vllm).
+     Ownership of a table is then split between two classes.
+  2. The block manager owns the tables, keyed by an integer sequence id (chosen).
+- **Decision:**
+  - One growth call, `allocate(seq_id, num_tokens)`, where `num_tokens` is the total the sequence
+    must hold afterwards. A new prompt, a prefill chunk, and a decode token are the same operation
+    with different totals, and a decode needs a new block exactly when it crosses a block
+    boundary.
+  - `blocks_needed` and `can_allocate` are pure queries so the scheduler can plan a whole step
+    before changing anything.
+  - Allocation is all-or-nothing and raises `OutOfBlocksError`; `free` of an unknown or already
+    freed sequence raises `KeyError`, because a double free is a scheduler bug.
+  - Tables are returned as tuples, so callers get snapshots and cannot corrupt the manager.
+  - Reference counts exist from the start (always 1 until prefix caching shares blocks).
+  - Allocation is deterministic for a given call history, so failures reproduce.
+  - The admission watermark and preemption are scheduler policies; the block manager only grants
+    or refuses.
+  - No torch import; a test enforces it.
+- **Evidence:** `tests/unit/test_block_manager.py`, including a randomized test (20 seeds × 300
+  operations) that checks every invariant after each call against a simple model of the expected
+  table sizes.
+
+### CPU-only torch for CI
+- **Decision:** On Linux, `torch` resolves from the PyTorch CPU wheel index (`[tool.uv.sources]`).
+  macOS uses the regular PyPI wheel. The CUDA build and the flash-attn wheel are installed in the
+  Modal GPU image instead (Phase 1b).
+- **Why:** The default Linux wheel bundles CUDA libraries of several GB that CPU tests never use.
+
+### Verifying the runner before the scheduler exists
+- **Context:** The model, KV cache, and runner can be wrong in ways unrelated to scheduling (slot
+  mapping, positions, causal masks over paged context). Debugging them together with a new
+  scheduler and block manager makes failures hard to attribute.
+- **Decision:** A scripted scheduler double under `tests/` replays fixed, hand-written step plans
+  with fixed block tables. It makes no decisions. The runner is first made token-exact against HF
+  with it; then the same end-to-end tests run against the real block manager and scheduler, and
+  Phase 1a is done only when they pass there.
