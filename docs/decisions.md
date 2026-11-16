@@ -293,3 +293,37 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   with fixed block tables. It makes no decisions. The runner is first made token-exact against HF
   with it; then the same end-to-end tests run against the real block manager and scheduler, and
   Phase 1a is done only when they pass there.
+
+### Scheduler interface and the prefill-priority baseline
+- **Context:** The scheduler has to express full prefills now, chunked prefills and mixed steps
+  later, decodes, and recompute after preemption, without the runner knowing which is which.
+- **Decision:**
+  - Per sequence, only two counters: `num_tokens` (prompt + generated) and
+    `num_computed_tokens` (positions whose KV is cached). A step entry computes positions
+    `num_computed_tokens .. +num_new_tokens-1`. A decode is an entry with one new token; a
+    recompute after preemption is a prefill of prompt + generated tokens from position 0. This is
+    the same model vLLM V1 uses, and it makes chunked and mixed steps a scheduling change only.
+  - Each entry carries its token ids, block table, start position, sampling parameters, and a
+    `sample` flag (false only for a non-final prefill chunk). The runner needs nothing else, so a
+    scripted plan can drive it in tests.
+  - `schedule()` allocates and preempts; `update()` advances `num_computed_tokens`, appends
+    sampled tokens, checks EOS before `max_tokens`, and frees finished sequences.
+  - Prefill-priority with mixed batching off: whenever the head of the waiting queue can be
+    admitted, the step is prefill-only; admission is strict FIFO and stops at the first request
+    that does not fit (`max_num_seqs`, token budget, or blocks minus the watermark). A prompt
+    longer than the budget runs alone. Otherwise all running sequences decode.
+  - Preemption victim: the most recently admitted running sequence not already in the step; if
+    none is left, the sequence that needs the block preempts itself. Preempted sequences return to
+    the front of the waiting queue in admission order, keeping their generated tokens.
+  - The watermark applies to admission only. Decodes may use the reserve.
+  - `add()` rejects a request that could not finish when running alone (prompt + `max_tokens`
+    over `max_model_len`, or more blocks than the pool minus the watermark).
+- **Why the `add()` check matters:** with newest-first preemption, the oldest running sequence is
+  never a victim while others exist, and a request that fits alone always completes once it is the
+  only one left. Without the check, a request too large for the pool would be admitted, preempt
+  everyone, then preempt itself forever.
+- **Evidence:** `tests/unit/test_scheduler.py`. A test runner keeps its own per-sequence record of
+  computed positions and checks each entry continues exactly where that record ends; generated
+  tokens depend on the whole history, so any wrong recompute changes the output and fails the
+  comparison with a reference produced without a scheduler. 15 random workloads with small block
+  pools (including preemptions) must all match the reference.
