@@ -26,6 +26,9 @@ Template:
 | 2026-11-16 | A10 (no L4 free) | ~4 (≈ 160 GPU-seconds billed) | 0.063 | Smoke run, flash vs reference, bf16 noise calibration |
 | 2026-11-17 | A10, then A10G, then A10 | ~10 (≈ 545 GPU-seconds billed) | 0.215 | Margin suite (A10), rerun after the preemption fix (landed on A10G), calibration + margin suite in one container (A10) |
 | | | | **0.284** | **Phase 1b total** (budget 4.00); billed figures from `modal billing report -r h`, which lists the A10 class as "A10G" |
+| 2026-11-17 | A10 | ~1 (≈ 23 GPU-seconds billed) | 0.010 | Phase 2: eight concurrent streaming clients on the real server |
+| 2026-11-17 | A10 | ~2 (≈ 88 GPU-seconds billed, incl. cold start) | 0.035 | Phase 2: `modal serve` endpoint for the GPU Reserve check |
+| | | | **0.045** | **Phase 2 total** (estimate 0.25); running total 0.329 |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
