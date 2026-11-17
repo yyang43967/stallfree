@@ -1,0 +1,30 @@
+[
+  {
+    "enable_thinking": "false",
+    "provider_class": "ChatOpenAI",
+    "invoke_text": "The capital of France is Paris.",
+    "invoke_usage": {
+      "input_tokens": 25,
+      "output_tokens": 8,
+      "total_tokens": 33,
+      "input_token_details": {},
+      "output_token_details": {}
+    },
+    "stream_text": "The capital of France is Paris.",
+    "reasoning_in_reply": false
+  },
+  {
+    "enable_thinking": "true",
+    "provider_class": "ChatOpenAI",
+    "invoke_text": "<think>\nOkay, the user is asking for the capital of France in one short sentence. Let me think. France's capital is Paris. I need to make sure it's a one-sentence answer. Maybe start with \"The capital of France is Paris.\" That's concise and accurate. Let me check if there's any other city that's commonly referred to as the capital. No, Paris is the only correct answer. I should double-check the spelling and grammar here. \"Paris\" is correct. Yep, that's all.\n</think>\n\nThe capital of France is Paris.",
+    "invoke_usage": {
+      "input_tokens": 21,
+      "output_tokens": 117,
+      "total_tokens": 138,
+      "input_token_details": {},
+      "output_token_details": {}
+    },
+    "stream_text": "<think>\nOkay, the user is asking for the capital of France in a one-sentence short answer. Let me recall... France's capital is Paris. I need to make sure it's a single sentence without any extra words. Maybe start with \"The capital of France is...\" and mention Paris as the main city. Let me check again. Yep, that works. No need for more explanation. Alright, ready to present the answer.\n</think>\n\nThe capital of France is Paris.",
+    "reasoning_in_reply": true
+  }
+]

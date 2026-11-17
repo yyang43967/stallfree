@@ -162,6 +162,27 @@ class Scheduler:
         """The waiting or running sequence with this id, or None."""
         return self._seqs.get(seq_id)
 
+    def validate(self, num_prompt_tokens: int, max_tokens: int) -> None:
+        """Raise ``ValueError`` if a request of this size could never finish running alone.
+
+        Pure: reads only constants (limits, pool size, watermark), so it is safe to call from
+        another thread while a step runs, e.g. to reject a request before streaming begins.
+        """
+        max_len = num_prompt_tokens + max_tokens
+        if max_len > self._config.max_model_len:
+            raise ValueError(
+                f"prompt ({num_prompt_tokens}) + max_tokens ({max_tokens}) exceeds "
+                f"max_model_len ({self._config.max_model_len})"
+            )
+        # Conservative by one token: the last sampled token never needs a KV slot.
+        usable = self._bm.num_blocks - self._watermark_blocks
+        block_size = self._bm.block_size
+        if -(-max_len // block_size) > usable:
+            raise ValueError(
+                f"request needs up to {max_len} tokens of KV cache, more than the "
+                f"{usable * block_size} available to one request"
+            )
+
     def add(self, seq: Sequence) -> None:
         """Append a new request to the end of the waiting queue.
 
@@ -179,20 +200,7 @@ class Scheduler:
             raise ValueError(f"{seq!r} is not a fresh request")
         if seq.seq_id in self._seqs:
             raise ValueError(f"seq_id {seq.seq_id} is already waiting or running")
-        max_len = seq.num_prompt_tokens + seq.sampling_params.max_tokens
-        if max_len > self._config.max_model_len:
-            raise ValueError(
-                f"prompt ({seq.num_prompt_tokens}) + max_tokens "
-                f"({seq.sampling_params.max_tokens}) exceeds max_model_len "
-                f"({self._config.max_model_len})"
-            )
-        # Conservative by one token: the last sampled token never needs a KV slot.
-        usable = self._bm.num_blocks - self._watermark_blocks
-        if self._bm.blocks_needed(seq.seq_id, max_len) > usable:
-            raise ValueError(
-                f"request needs up to {max_len} tokens of KV cache, more than the "
-                f"{usable * self._bm.block_size} available to one request"
-            )
+        self.validate(seq.num_prompt_tokens, seq.sampling_params.max_tokens)
         self._waiting.append(seq)
         self._seqs[seq.seq_id] = seq
 

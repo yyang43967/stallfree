@@ -26,6 +26,9 @@ Template:
 | 2026-11-16 | A10 (no L4 free) | ~4 (≈ 160 GPU-seconds billed) | 0.063 | Smoke run, flash vs reference, bf16 noise calibration |
 | 2026-11-17 | A10, then A10G, then A10 | ~10 (≈ 545 GPU-seconds billed) | 0.215 | Margin suite (A10), rerun after the preemption fix (landed on A10G), calibration + margin suite in one container (A10) |
 | | | | **0.284** | **Phase 1b total** (budget 4.00); billed figures from `modal billing report -r h`, which lists the A10 class as "A10G" |
+| 2026-11-17 | A10 | ~1 (≈ 23 GPU-seconds billed) | 0.010 | Phase 2: eight concurrent streaming clients on the real server |
+| 2026-11-17 | A10 | ~2 (≈ 88 GPU-seconds billed, incl. cold start) | 0.035 | Phase 2: `modal serve` endpoint for the GPU Reserve check |
+| | | | **0.045** | **Phase 2 total** (estimate 0.25); running total 0.329 |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
@@ -623,3 +626,121 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   above.
 - **KV sizing in that run:** 509 blocks (13.92 GiB), lower than the smoke run's 649 because the
   Hugging Face reference model was still resident in the same process (5.81 GiB in use).
+
+## Phase 2 — Online serving
+
+### API protocol, chat templates, and incremental text
+- **Request handling:** `/v1/chat/completions` accepts the OpenAI fields this server can honour
+  (`model`, `messages`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `stream`,
+  `stream_options.include_usage`) plus vLLM's `chat_template_kwargs` and `ignore_eos`. Fields that
+  would change the response but are not implemented (`n > 1`, `stop`, `seed`, `tools`,
+  `tool_choice` other than "none", `logprobs`, `top_logprobs`, `response_format`, non-zero
+  penalties, `logit_bias`) are rejected with an OpenAI-shaped 400 naming them, so a client never
+  silently gets something it did not ask for. Other unknown fields are ignored, as OpenAI-
+  compatible servers commonly do.
+- **Tokenizer boundary:** the engine stays token ids in and out. A small `ChatTokenizer` interface
+  (render a chat with the model's template and tokenize it; decode without special tokens) has a
+  Hugging Face implementation for serving and a byte-level stub for CPU tests whose 256 ids match
+  the tiny model's vocabulary, so API tests need no tokenizer download. `chat_template_kwargs` go
+  straight to the template; with Qwen3, `enable_thinking=False` pre-fills an empty think block.
+- **Incremental decoding:** each new token decodes a short window ending at it and emits only the
+  text past what was already sent; a window ending in an incomplete UTF-8 character emits nothing
+  until a later token completes it. Concatenated deltas equal the full decode (tested with random
+  multi-byte text and with Qwen3's tokenizer), and no partial character is ever sent.
+- **Admission check before streaming:** `Scheduler.validate()` holds the "could this request ever
+  finish alone" check from `add()`. It reads only constants, so the API can reject an impossible
+  request with a 400 before the stream starts, without touching scheduler state while a step runs
+  in the worker thread. The scheduler's contract tests pass unchanged.
+- **CI:** the Qwen3 tokenizer files (no weights) are cached by the pinned revision for the
+  chat-template tests.
+
+### Async engine
+- **Ownership:** one background asyncio task (the loop) owns the synchronous engine; nothing else
+  calls it. Each `engine.step()` runs in a worker thread via `asyncio.to_thread`, so while the GPU
+  works the event loop keeps accepting connections and streaming tokens. The engine is never
+  called from two threads at once: new requests and aborts are appended to an inbox and applied by
+  the loop between steps.
+- **Per-request queues:** each request gets an `asyncio.Queue` of step outputs that its HTTP
+  handler reads. After a step, the loop puts each sequence's token in its queue and, if the request
+  finished, records it as done.
+- **Cancellation:** `generate()` is an async generator; if its consumer stops early (client
+  disconnect, task cancellation, `break`), its `finally` posts an abort, which the loop applies at
+  the next step boundary: the scheduler frees the blocks and the sequence is never scheduled
+  again. A step already running when the consumer stopped still completes, so an aborted request
+  may produce a token or two nobody reads.
+- **Backpressure:** at most `max_queued_requests` requests (waiting or running) at once; beyond
+  that `generate()` raises `QueueFullError` immediately and the API returns 503, instead of
+  queueing without bound. Requests that could never fit are rejected in `generate()` itself
+  (`Scheduler.validate()`), before the loop sees them.
+- **Failure:** if a step raises, the loop records the error, delivers `EngineDeadError` to every
+  waiting request, and refuses new ones, rather than leaving clients hanging.
+- **Metrics** (one JSON log line per request on `stallfree.metrics`): `queue_s` from arrival to the
+  start of the step that produced the first token, `ttft_s` to that token, `tpot_s` as the mean
+  gap between later tokens, `e2e_s`, token counts, and finish reason. With mixed batching off, the
+  first token comes from the request's prefill step, so `queue_s` is the time before its prefill
+  started; once prefills are chunked (Phase 3) it becomes the time before its last chunk started,
+  which will need its own field.
+- **Evidence:** `tests/unit/test_async_engine.py` (each event loop wrapped in a 30 s deadline, so a
+  broken engine fails rather than hangs). A first mutation pass left three bugs undetected: an
+  abort that never reached the engine (the request quietly ran to its limit and then freed its
+  blocks), skipping the up-front validation (the loop's safety net still raised, only later), and
+  queue time recorded as time to first token. Tests now check that generation stops within two
+  steps of an abort, that impossible requests fail without the loop running, and that with a
+  50 ms step TTFT exceeds queue time by at least 40 ms. All nine mutants fail.
+
+### HTTP server
+- **Decision:** FastAPI with `/health` (open), `/v1/models`, and `/v1/chat/completions` (bearer key
+  checked in constant time when configured; 401 otherwise). The handler validates the request,
+  renders and tokenizes the chat, checks admission (`Scheduler.validate()`) and capacity, and only
+  then either collects the whole completion (JSON) or returns an SSE stream. Every error uses
+  OpenAI's `{"error": {message, type, param, code}}` shape: 400 for invalid or unsupported input,
+  404 for another model name, 401, 503 when at capacity, 500 if the engine loop died.
+- **Streaming:** the first event carries the assistant role, then one event per text delta from the
+  incremental detokenizer, then an empty delta with the finish reason, then (if
+  `stream_options.include_usage`) a usage event with empty `choices`, then `data: [DONE]`.
+- **Why the capacity check happens before the stream starts:** once a 200 SSE response has begun,
+  an error can only be sent as an event inside it, which clients handle inconsistently. Checking
+  first gives a plain 503. A mutation test removing that check went unnoticed until a test sent a
+  streaming request to a full server.
+- **Disconnects:** when a streaming client disconnects, Starlette cancels the response generator;
+  the cancellation lands inside the engine's `generate()`, whose `finally` posts the abort. The
+  response generator also closes the engine stream explicitly in its own `finally`. Removing that
+  close did not fail any test, because cancellation and asyncio's finalizer for abandoned async
+  generators reach the same abort; it is kept so the abort does not depend on garbage collection.
+  A non-streaming request whose client disconnects runs to completion (its blocks are freed when
+  it finishes).
+- **Defaults:** temperature 1.0 and top_p 1.0 when omitted (OpenAI's defaults); `max_tokens`
+  defaults to the room left in `max_model_len`.
+- **Evidence:** `tests/integration/test_api.py` runs a real uvicorn server in a thread with the
+  tiny model and a byte-level tokenizer and drives it with the `openai` client: greedy output
+  equals Hugging Face's for the same prompt ids, streamed text equals non-streamed text, usage is
+  exact, 8 concurrent async streams each match their own reference and never mix chunk ids,
+  `chat_template_kwargs` change the prompt, unsupported parameters get a 400 naming them, a
+  disconnect mid-stream frees all blocks and stops generation, a full server answers 503 (JSON and
+  streaming), and `ignore_eos` overrides an end-of-sequence token the model actually produces.
+
+### Serving on Modal and the GPU checks
+- **Endpoint:** `modal_apps/serve.py` serves the FastAPI app as a Modal ASGI app (flash backend,
+  bf16, cache sized automatically, one container, up to 256 concurrent requests per container,
+  scaled to zero after 60 idle seconds). The bearer key is read from the local environment when
+  the app is created and attached as an ephemeral secret, so no named secret is stored in the
+  workspace. For the checks below it ran under `modal serve` (a temporary URL that disappears
+  when the command ends) rather than `modal deploy`. Stopping the local `modal serve` process left
+  the app "ephemeral" until `modal app stop -y` was run; the session checklist now ends with that
+  and `modal app list`.
+- **GPU concurrency run** (`docs/data/concurrency_gpu.json`, NVIDIA A10): the real server with the
+  Qwen3 tokenizer, eight `openai` async clients streaming at once (greedy, up to 64 tokens,
+  thinking off). Eight distinct response ids, one per stream, every stream with a finish reason
+  and correct usage. Content against Hugging Face bf16 greedy under the margin rule: five
+  identical, three diverging at gaps 0.25, 0.25, and 0.125 (the same prompts and positions as in
+  the single-request margin suite), all passing.
+- **GPU Reserve compatibility** (`docs/data/gpu_reserve_check.json`): `scripts/gpu_reserve_check.py`,
+  run with GPU Reserve's own Python, builds its chat model through its unmodified provider code
+  (`ASSISTANT_MODEL=vllm:Qwen/Qwen3-0.6B`, a LangChain `ChatOpenAI` on chat completions with
+  `stream_usage`) with only the base URL and key pointing here, from an empty directory so its
+  `.env` is never read. With thinking off, `invoke` and `stream` both return "The capital of France
+  is Paris." with no reasoning; the prompt is 4 tokens longer than with thinking on (the empty think
+  block the template adds), so `chat_template_kwargs` reached the template. With thinking on, the
+  reply contains a `<think>...</think>` block before the answer. GPU Reserve sends no temperature, so
+  the OpenAI default of 1.0 applies and its `invoke` and `stream` texts differ. Tool calling stays
+  out of scope.
