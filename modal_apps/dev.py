@@ -11,6 +11,7 @@ Every GPU function reports which GPU ran and how long the function body took.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -119,15 +120,18 @@ def smoke_run() -> dict[str, Any]:
 @app.function(**GPU_FN, timeout=1800)  # type: ignore[arg-type]
 def run_gpu_tests(select: str = "") -> dict[str, Any]:
     start = time.time()
+    report = Path("/tmp/margin_report.json")
     cmd = ["python", "-m", "pytest", "-q", "-s", "-m", "gpu", "-p", "no:cacheprovider", "tests/gpu"]
     if select:
         cmd += ["-k", select]
-    proc = subprocess.run(cmd, cwd="/root", capture_output=True, text=True)
+    env = {**os.environ, "STALLFREE_REPORT": str(report)}
+    proc = subprocess.run(cmd, cwd="/root", capture_output=True, text=True, env=env)
     return {
         "gpu": _gpu_name(),
         "returncode": proc.returncode,
         "output": proc.stdout[-12000:],
         "stderr": proc.stderr[-3000:],
+        "margin_report": json.loads(report.read_text()) if report.exists() else None,
         "seconds": round(time.time() - start, 1),
     }
 
@@ -145,6 +149,45 @@ def run_calibration() -> dict[str, Any]:
     return result
 
 
+@app.function(**GPU_FN, timeout=2400)  # type: ignore[arg-type]
+def run_calibration_and_margin() -> dict[str, Any]:
+    """Calibration and the margin suite in one container, so both run on the same GPU."""
+    import sys
+
+    start = time.time()
+    sys.path.insert(0, "/root")
+    from tests.gpu.calibration import run_calibration as calibrate_fn
+
+    calibration = calibrate_fn(MODEL_DIR)
+    cal_path = Path("/tmp/tau_calibration.json")
+    cal_path.write_text(json.dumps(calibration))
+    report = Path("/tmp/margin_report.json")
+    env = {**os.environ, "STALLFREE_REPORT": str(report), "STALLFREE_CALIBRATION": str(cal_path)}
+    cmd = [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-s",
+        "-m",
+        "gpu",
+        "-p",
+        "no:cacheprovider",
+        "tests/gpu",
+        "-k",
+        "margin",
+    ]
+    proc = subprocess.run(cmd, cwd="/root", capture_output=True, text=True, env=env)
+    return {
+        "gpu": _gpu_name(),
+        "calibration": calibration,
+        "margin_report": json.loads(report.read_text()) if report.exists() else None,
+        "returncode": proc.returncode,
+        "output": proc.stdout[-8000:],
+        "seconds": round(time.time() - start, 1),
+    }
+
+
 @app.local_entrypoint()
 def download() -> None:
     print(download_weights.remote())
@@ -156,8 +199,14 @@ def smoke() -> None:
 
 
 @app.local_entrypoint()
-def gpu_tests(select: str = "") -> None:
-    r = run_gpu_tests.remote(select)
+def gpu_tests(select: str = "", gpu: str = "") -> None:
+    """``--gpu A10`` pins one GPU type (calibration and the margin suite must share one)."""
+    fn = run_gpu_tests.with_options(gpu=gpu) if gpu else run_gpu_tests
+    r = fn.remote(select)
+    if r.get("margin_report"):
+        out = Path("docs/data/margin_suite.json")
+        out.write_text(json.dumps(r["margin_report"], indent=2) + "\n")
+        print(f"wrote {out}")
     print(r["output"])
     print(r["stderr"])
     print(f"gpu={r['gpu']} returncode={r['returncode']} seconds={r['seconds']}")
@@ -170,3 +219,16 @@ def calibrate() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(r, indent=2) + "\n")
     print(f"wrote {out}; gpu={r['gpu']} seconds={r['seconds']}")
+
+
+@app.local_entrypoint()
+def calibrate_and_margin(gpu: str = "A10") -> None:
+    fn = run_calibration_and_margin.with_options(gpu=gpu)
+    r = fn.remote()
+    Path("docs/data/tau_calibration.json").write_text(json.dumps(r["calibration"], indent=2) + "\n")
+    if r["margin_report"]:
+        Path("docs/data/margin_suite.json").write_text(
+            json.dumps(r["margin_report"], indent=2) + "\n"
+        )
+    print(r["output"])
+    print(f"gpu={r['gpu']} returncode={r['returncode']} seconds={r['seconds']}")

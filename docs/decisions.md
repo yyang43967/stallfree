@@ -559,3 +559,65 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   mixing a chunk, a decode, and a fresh prefill on interleaved blocks, each in bf16 and fp16. All
   pass; flash's error never exceeded the reference's (bf16 worst 1.4e-2 vs 2.9e-2, fp16 2.1e-3 vs
   2.5e-3).
+
+### bf16 margin threshold τ = 0.5
+- **Calibration** (`docs/data/tau_calibration.json`, A10, 32 chat prompts, greedy, up to 64 new
+  tokens, 1,702 generated positions). Reference R: Hugging Face bf16, eager attention, one prompt
+  at a time. Three noise sources, each changing one thing:
+  - B, bf16 eager in batches of 8 (left padding): 15/32 prompts diverge from R; R's top-1 minus
+    top-2 gap at the first differing token: 0.0 ×2, 0.125 ×9, 0.25 ×4 (largest 0.25);
+  - S, bf16 SDPA attention instead of eager: 18/32; 0.0 ×5, 0.0625 ×1, 0.125 ×7, 0.25 ×4, 0.5 ×1
+    (largest 0.5);
+  - F, fp32 eager: 12/32; 0.0 ×3, 0.125 ×5, 0.25 ×3, 0.5 ×1 (largest 0.5).
+  Over all positions R's gap has minimum 0 (exact ties at 24 positions), 5th percentile 0.25,
+  median 2.6; 11.5% of positions are below 0.5.
+- **Observation: the gaps are quantized.** Every divergence gap is 0, 0.0625, 0.125, 0.25, or 0.5:
+  the logits come out of the vocabulary projection in bf16, whose spacing at logit magnitudes of
+  about 16 to 32 is 0.125 to 0.25. A gap is a whole number of those steps, and 0 is an exact tie.
+- **Decision: τ = 0.5** (`tests/gpu/margin.py`, `BF16_MARGIN_TAU`), the largest gap at which HF
+  disagreed with itself across all three sources, about two bf16 steps.
+- **Why not 0.25 (batch shape alone):** this engine differs from HF in more than batch shape. It
+  uses a different attention kernel (FlashAttention; S models a kernel change) and different
+  matrix-multiplication shapes (a flat batch; F shows how far exact arithmetic moves the argmax).
+  Both reach 0.5. Batch shape alone underestimates the noise a correct implementation can show,
+  and a τ of 0.25 would fail correct code on some prompts.
+- **The rule stays strict where the model is confident:** a divergence passes only if the
+  reference itself was within τ at that position; the teacher-forced check (the reference's whole
+  sequence fed through the engine in one prefill) must give the same top-1 token at every position
+  where the reference's gap exceeds τ.
+
+### bf16 correctness on the real model (margin rule, teacher forcing, preemption)
+- **Same GPU for calibration and suite.** Modal's `A10` request lands on either an "NVIDIA A10" or
+  an "NVIDIA A10G" host. A margin run that landed on an A10G
+  (`docs/data/margin_suite_run2_a10g.json`) passed every check but could not be compared with a
+  calibration done on an A10, and showed a gap value (0.375) the A10 calibration never produced.
+  The final numbers therefore come from one function that runs calibration and then the margin
+  suite in the same container (`modal_apps/dev.py::calibrate_and_margin`), so both share one GPU.
+  That run was on an NVIDIA A10 and reproduced the first A10 calibration exactly
+  (`docs/data/tau_calibration_run1_a10.json`), so τ = 0.5 stands.
+- **Results** (`docs/data/margin_suite.json`, NVIDIA A10, Qwen3-0.6B bf16, flash backend, cache
+  sized automatically, 32 chat prompts, greedy, up to 64 tokens):
+
+  | | diverged (of 32) | gaps at divergence | failed the rule |
+  |---|---|---|---|
+  | engine, one prompt at a time | 15 | 0.0 ×3, 0.125 ×8, 0.25 ×3, 0.5 ×1 | 0 |
+  | engine, all 32 batched | 14 | 0.0 ×4, 0.125 ×6, 0.25 ×3, 0.5 ×1 | 0 |
+  | HF bf16 eager, batch 8 (same run) | 15 | largest 0.25 | n/a |
+  | HF bf16 SDPA (same run) | 18 | largest 0.5 | n/a |
+  | HF fp32 (same run) | 12 | largest 0.5 | n/a |
+
+  The engine diverges no more often than HF does against itself with a different kernel, and the
+  divergences do not cluster at τ: the single 0.5 case (prompt 27, position 19) is a position
+  where HF's SDPA and fp32 runs also diverge.
+- **Teacher-forced check:** the reference's 32 sequences (1,702 positions) through the engine's
+  model in one prefill each: at all 1,451 positions where the reference's gap exceeds τ, the top-1
+  token matches, with both the flash and the PyTorch backend. Their logits differ by at most 0.91
+  (bf16 logits of magnitude up to about 30 have a spacing of 0.125 to 0.25).
+- **Forced preemption on GPU:** four requests of 202 to 215 tokens (one 256-token block each)
+  generating 100 tokens (into a second block) on a 6-block cache: one preemption, all four pass
+  the rule (two exact, divergences at gaps 0.125 and 0.0). A first version used prompts of about
+  100 tokens, which never left their first block, so nothing was preempted and the test failed
+  its own assertion; the prompts were lengthened (measured with the tokenizer) before the result
+  above.
+- **KV sizing in that run:** 509 blocks (13.92 GiB), lower than the smoke run's 649 because the
+  Hugging Face reference model was still resident in the same process (5.81 GiB in use).

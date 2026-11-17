@@ -1,0 +1,727 @@
+{
+  "gpu": "NVIDIA A10G",
+  "tau": 0.5,
+  "num_prompts": 32,
+  "memory": "total 22.08 GiB, in use 3.29 GiB, activation peak 0.10 GiB (4096 tokens), 602 blocks of 28.0 MiB = 16.46 GiB KV cache",
+  "results": {
+    "single": [
+      {
+        "prompt": 0,
+        "ref_len": 10,
+        "our_len": 10,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 1,
+        "ref_len": 56,
+        "our_len": 56,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 2,
+        "ref_len": 18,
+        "our_len": 18,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 3,
+        "ref_len": 26,
+        "our_len": 26,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 4,
+        "ref_len": 12,
+        "our_len": 12,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 5,
+        "ref_len": 23,
+        "our_len": 23,
+        "exact": false,
+        "position": 5,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 2613,
+        "our_token": 943
+      },
+      {
+        "prompt": 6,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 7,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 36,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 10964,
+        "our_token": 2379
+      },
+      {
+        "prompt": 8,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 61,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 17,
+        "our_token": 19
+      },
+      {
+        "prompt": 9,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 10,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 11,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 34,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 4065,
+        "our_token": 22696
+      },
+      {
+        "prompt": 12,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 24,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 6051,
+        "our_token": 592
+      },
+      {
+        "prompt": 13,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 19,
+        "gap": 0.25,
+        "passes": true,
+        "ref_token": 279,
+        "our_token": 28030
+      },
+      {
+        "prompt": 14,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 44,
+        "gap": 0.375,
+        "passes": true,
+        "ref_token": 330,
+        "our_token": 264
+      },
+      {
+        "prompt": 15,
+        "ref_len": 59,
+        "our_len": 60,
+        "exact": false,
+        "position": 31,
+        "gap": 0.25,
+        "passes": true,
+        "ref_token": 51,
+        "our_token": 43
+      },
+      {
+        "prompt": 16,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 17,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 18,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 8,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 334,
+        "our_token": 311
+      },
+      {
+        "prompt": 19,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 20,
+        "ref_len": 18,
+        "our_len": 24,
+        "exact": false,
+        "position": 10,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 11,
+        "our_token": 323
+      },
+      {
+        "prompt": 21,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 4,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 334,
+        "our_token": 97219
+      },
+      {
+        "prompt": 22,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 54,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 3063,
+        "our_token": 2297
+      },
+      {
+        "prompt": 23,
+        "ref_len": 20,
+        "our_len": 17,
+        "exact": false,
+        "position": 2,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 6303,
+        "our_token": 9396
+      },
+      {
+        "prompt": 24,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 15,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 2319,
+        "our_token": 2867
+      },
+      {
+        "prompt": 25,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 26,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 32,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 11941,
+        "our_token": 3259
+      },
+      {
+        "prompt": 27,
+        "ref_len": 51,
+        "our_len": 51,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 28,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 49,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 44622,
+        "our_token": 481
+      },
+      {
+        "prompt": 29,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 30,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 31,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 35,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 10362,
+        "our_token": 8413
+      }
+    ],
+    "batched": [
+      {
+        "prompt": 0,
+        "ref_len": 10,
+        "our_len": 10,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 1,
+        "ref_len": 56,
+        "our_len": 56,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 2,
+        "ref_len": 18,
+        "our_len": 18,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 3,
+        "ref_len": 26,
+        "our_len": 26,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 4,
+        "ref_len": 12,
+        "our_len": 12,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 5,
+        "ref_len": 23,
+        "our_len": 23,
+        "exact": false,
+        "position": 5,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 2613,
+        "our_token": 943
+      },
+      {
+        "prompt": 6,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 7,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 36,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 10964,
+        "our_token": 2379
+      },
+      {
+        "prompt": 8,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 61,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 17,
+        "our_token": 19
+      },
+      {
+        "prompt": 9,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 10,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 11,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 34,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 4065,
+        "our_token": 22696
+      },
+      {
+        "prompt": 12,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 37,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 5209,
+        "our_token": 16503
+      },
+      {
+        "prompt": 13,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 19,
+        "gap": 0.25,
+        "passes": true,
+        "ref_token": 279,
+        "our_token": 28030
+      },
+      {
+        "prompt": 14,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 44,
+        "gap": 0.375,
+        "passes": true,
+        "ref_token": 330,
+        "our_token": 264
+      },
+      {
+        "prompt": 15,
+        "ref_len": 59,
+        "our_len": 49,
+        "exact": false,
+        "position": 31,
+        "gap": 0.25,
+        "passes": true,
+        "ref_token": 51,
+        "our_token": 43
+      },
+      {
+        "prompt": 16,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 8,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 3070,
+        "our_token": 36200
+      },
+      {
+        "prompt": 17,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 18,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 19,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 20,
+        "ref_len": 18,
+        "our_len": 24,
+        "exact": false,
+        "position": 10,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 11,
+        "our_token": 323
+      },
+      {
+        "prompt": 21,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 4,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 334,
+        "our_token": 97219
+      },
+      {
+        "prompt": 22,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 23,
+        "ref_len": 20,
+        "our_len": 17,
+        "exact": false,
+        "position": 2,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 6303,
+        "our_token": 9396
+      },
+      {
+        "prompt": 24,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 25,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 26,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 32,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 11941,
+        "our_token": 3259
+      },
+      {
+        "prompt": 27,
+        "ref_len": 51,
+        "our_len": 51,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 28,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 29,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 62,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 11941,
+        "our_token": 1896
+      },
+      {
+        "prompt": 30,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      },
+      {
+        "prompt": 31,
+        "ref_len": 64,
+        "our_len": 64,
+        "exact": false,
+        "position": 38,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 11,
+        "our_token": 438
+      }
+    ]
+  },
+  "summary": {
+    "single": {
+      "diverged": 17,
+      "failed_rule": 0,
+      "gap_histogram": {
+        "0.0": 5,
+        "0.125": 9,
+        "0.25": 2,
+        "0.375": 1
+      }
+    },
+    "batched": {
+      "diverged": 15,
+      "failed_rule": 0,
+      "gap_histogram": {
+        "0.0": 6,
+        "0.125": 6,
+        "0.25": 2,
+        "0.375": 1
+      }
+    }
+  },
+  "hf_self_divergence_out_of_32": {
+    "B_batch8": 15,
+    "S_sdpa": 18,
+    "F_fp32": 12
+  },
+  "teacher_forced": {
+    "positions": 1701,
+    "checked_above_tau": 1451,
+    "flash_mismatches": [],
+    "torch_ref_mismatches": [],
+    "max_abs_logit_diff_flash_vs_torch_ref": 0.984375
+  },
+  "preemption": {
+    "num_preemptions": 1,
+    "blocks": 6,
+    "block_size": 256,
+    "results": [
+      {
+        "prompt_len": 214,
+        "exact": false,
+        "position": 0,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 785,
+        "our_token": 16
+      },
+      {
+        "prompt_len": 215,
+        "exact": false,
+        "position": 45,
+        "gap": 0.125,
+        "passes": true,
+        "ref_token": 8205,
+        "our_token": 10876
+      },
+      {
+        "prompt_len": 202,
+        "exact": false,
+        "position": 56,
+        "gap": 0.0,
+        "passes": true,
+        "ref_token": 19641,
+        "our_token": 35127
+      },
+      {
+        "prompt_len": 203,
+        "exact": true,
+        "position": null,
+        "gap": null,
+        "passes": true
+      }
+    ]
+  }
+}
