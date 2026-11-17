@@ -438,3 +438,23 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   first two do not sample, one step mixing a chunk continuation, a decode, and a fresh prefill,
   and a recompute: after some decodes the same sequence is prefilled again from position 0 into
   different blocks while its old blocks are overwritten with garbage.
+
+### Sampler
+- **Decision:** One sampler per engine with its own seeded `torch.Generator`. Per row:
+  temperature 0 is greedy (`argmax`, ties to the lowest id, as Hugging Face); otherwise logits are
+  divided by the temperature and turned into probabilities in fp32, nucleus (top-p) filtering
+  keeps every token whose more-likely tokens hold less than `top_p` of the mass (so the most
+  likely token is always kept and the kept set is the smallest reaching `top_p`), and one token is
+  drawn with `torch.multinomial` from the filtered weights.
+- **Why fp32:** with bf16 logits the softmax of a 151,936-way distribution loses most small
+  probabilities to rounding; computing it in fp32 costs little because it runs on the sampled rows
+  only.
+- **Why a per-engine generator:** a fixed seed makes a whole run reproducible for debugging, and
+  greedy rows consume no random numbers, so adding a greedy request does not change the draws of
+  sampled ones. Per-request seeds are deferred along with the `seed` API parameter.
+- **Not implemented:** top-k, min-p, repetition and frequency penalties, logprobs.
+- **Evidence:** `tests/unit/test_sampler.py` checks greedy and ties, that greedy draws no random
+  numbers, frequencies against the expected softmax at temperature 1 and 0.5 (20,000 draws,
+  tolerance 0.015, about four standard deviations), the top-p kept set at boundary values and in
+  shuffled token order, that sampling never leaves the nucleus, reproducibility by seed, and mixed
+  greedy and random rows. Nine deliberate bugs each fail at least one test.
