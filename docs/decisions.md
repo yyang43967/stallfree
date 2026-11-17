@@ -21,7 +21,7 @@ Template:
 
 | Date | GPU | Minutes | Cost (USD) | Purpose |
 |---|---|---|---|---|
-| — | — | — | — | No GPU used yet |
+| 2026-11-16 | L4 | ≤ 1 (plus ~12 queued for capacity, not billed) | ≤ 0.02 | Session 1a: driver check (driver 620.70.06) |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
@@ -503,3 +503,46 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   that reserves one slot too few, scheduler entries missing the last token, block counts rounded
   down, per-entry positions starting at 0, and a block leak all fail it. The leak first showed up
   as a hang, which led to the engine's no-progress guard.
+
+## Phase 1b — GPU path
+
+### Driver and development GPU
+- **Driver check (2026-11-16, before any image build):** a Modal L4 reported NVIDIA L4, driver
+  620.70.06, 23,034 MiB. CUDA 13 wheels need driver 580 or newer, so the planned torch 2.10.0
+  (CUDA 13) + flash-attn 2.8.3 stack stays; the CUDA 12.8 fallback was not needed.
+- **Capacity:** the L4 request waited about 12 minutes for capacity. Development functions now
+  request `["L4", "A10"]`: L4 preferred, A10 (Ampere, sm_86, 24 GB, $1.10/h) accepted when no
+  L4 is free. Every result records which GPU ran. Calibration of the bf16 tolerance and the
+  bf16 correctness suite run on one GPU type end to end; if they would land on different types,
+  calibration is repeated on the second. If A10 is used, it is development only: the benchmark
+  target stays L40S (Ada, sm_89).
+
+### FlashAttention backend
+- **Decision:** `attention/flash.py` writes the step's new K/V with the same `index_copy_` as the
+  reference backend, then calls `flash_attn_varlen_func` once per layer with the cache's
+  `[num_blocks, block_size, Hkv, D]` slices, `cu_seqlens_q`, `cu_seqlens_k` (cumulative context
+  lengths, newly added to the metadata), the longest query and context lengths, `causal=True`,
+  and the padded block tables. Every segment (prefill, chunk, decode) is one variable-length
+  sequence in a single call; FlashAttention aligns the causal mask to the end of each context,
+  which is what a segment starting at position `s > 0` needs.
+- **Guards:** the backend refuses a non-CUDA cache and a block size that is not a multiple of 256;
+  the engine refuses the flash backend on a non-CUDA device at construction.
+- **`flash_attn` stays optional:** it is imported when the backend is built, never at module
+  import. A CPU test blocks the module with an import hook and checks that `import stallfree` and
+  a reference-backend engine run end to end without it. mypy ignores the missing module only for
+  `flash_attn`.
+
+### KV cache sizing from GPU memory
+- **Decision:** with `num_blocks=None` (CUDA only), the engine loads the weights, runs one forward
+  of the largest possible step (`max(max_num_batched_tokens, max_model_len)` tokens as one prefill,
+  plus logits for `max_num_seqs` rows) on a throwaway cache, and reads the allocator's peak above
+  the post-load baseline, minus the throwaway cache itself. The cache then gets
+  `gpu_memory_utilization * total - (total - free) - activation_peak`, in whole blocks of
+  `bytes_per_token * block_size` (28 MiB for Qwen3-0.6B in bf16). `total - free` is measured from
+  the device, so it counts weights, the CUDA context, and anything else on the GPU.
+- **Why profile instead of estimating:** activation memory depends on kernels and on the largest
+  step, and the CUDA context is not visible to PyTorch's allocator. Measuring both avoids running
+  out of memory on the first long prompt.
+- **Evidence (CPU):** `tests/unit/test_memory_and_flash_cpu.py` checks the arithmetic (worked
+  24 GiB example, rounding down, failure when no block fits) and the 28 MiB block; the measured
+  values on L4 are recorded below once a GPU session has run.

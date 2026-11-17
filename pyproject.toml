@@ -49,6 +49,11 @@ python_version = "3.12"
 strict = true
 files = ["src"]
 
+# CUDA-only and installed in the GPU image only; imported lazily by the flash backend.
+[[tool.mypy.overrides]]
+module = ["flash_attn", "flash_attn.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]

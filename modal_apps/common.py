@@ -10,7 +10,9 @@ MODEL_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
 WEIGHTS_DIR = "/weights"
 MODEL_DIR = f"{WEIGHTS_DIR}/qwen3-0.6b-{MODEL_REVISION[:7]}"
 
-GPU = "L4"  # development GPU; the benchmark uses L40S
+# Development GPUs: L4 preferred, A10 accepted when no L4 is available. Every result records
+# which one ran. The benchmark uses L40S.
+GPU = ["L4", "A10"]
 
 # Prebuilt FlashAttention-2 wheel for torch 2.10 / CUDA 13 / CPython 3.12, pinned by hash.
 FLASH_ATTN_WHEEL = (
