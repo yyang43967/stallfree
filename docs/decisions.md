@@ -249,3 +249,257 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
 - **Risk noted in the methodology:** stallfree runs its API and engine loop in one Python process,
   while vLLM separates the API server from the engine core. CPU contention inside stallfree's
   process is part of what is measured and will be discussed as a source of any gap.
+
+## Phase 1a — CPU engine
+
+### Block manager interface
+- **Context:** The block manager has to serve three callers with different needs: admission of a
+  new prompt, growth by one prefill chunk, and growth by one decode token. It also has to be
+  testable without tensors.
+- **Options considered:**
+  1. Block tables stored on the sequence object and mutated by the block manager (nano-vllm).
+     Ownership of a table is then split between two classes.
+  2. The block manager owns the tables, keyed by an integer sequence id (chosen).
+- **Decision:**
+  - One growth call, `allocate(seq_id, num_tokens)`, where `num_tokens` is the total the sequence
+    must hold afterwards. A new prompt, a prefill chunk, and a decode token are the same operation
+    with different totals, and a decode needs a new block exactly when it crosses a block
+    boundary.
+  - `blocks_needed` and `can_allocate` are pure queries so the scheduler can plan a whole step
+    before changing anything.
+  - Allocation is all-or-nothing and raises `OutOfBlocksError`; `free` of an unknown or already
+    freed sequence raises `KeyError`, because a double free is a scheduler bug.
+  - Tables are returned as tuples, so callers get snapshots and cannot corrupt the manager.
+  - Reference counts exist from the start (always 1 until prefix caching shares blocks).
+  - Allocation is deterministic for a given call history, so failures reproduce.
+  - The admission watermark and preemption are scheduler policies; the block manager only grants
+    or refuses.
+  - No torch import; a test enforces it.
+- **Evidence:** `tests/unit/test_block_manager.py`, including a randomized test (20 seeds × 300
+  operations) that checks every invariant after each call against a simple model of the expected
+  table sizes.
+
+### CPU-only torch for CI
+- **Decision:** On Linux, `torch` resolves from the PyTorch CPU wheel index (`[tool.uv.sources]`).
+  macOS uses the regular PyPI wheel. The CUDA build and the flash-attn wheel are installed in the
+  Modal GPU image instead (Phase 1b).
+- **Why:** The default Linux wheel bundles CUDA libraries of several GB that CPU tests never use.
+
+### Verifying the runner before the scheduler exists
+- **Context:** The model, KV cache, and runner can be wrong in ways unrelated to scheduling (slot
+  mapping, positions, causal masks over paged context). Debugging them together with a new
+  scheduler and block manager makes failures hard to attribute.
+- **Decision:** A scripted scheduler double under `tests/` replays fixed, hand-written step plans
+  with fixed block tables. It makes no decisions. The runner is first made token-exact against HF
+  with it; then the same end-to-end tests run against the real block manager and scheduler, and
+  Phase 1a is done only when they pass there.
+
+### Scheduler interface and the prefill-priority baseline
+- **Context:** The scheduler has to express full prefills now, chunked prefills and mixed steps
+  later, decodes, and recompute after preemption, without the runner knowing which is which.
+- **Decision:**
+  - Per sequence, only two counters: `num_tokens` (prompt + generated) and
+    `num_computed_tokens` (positions whose KV is cached). A step entry computes positions
+    `num_computed_tokens .. +num_new_tokens-1`. A decode is an entry with one new token; a
+    recompute after preemption is a prefill of prompt + generated tokens from position 0. This is
+    the same model vLLM V1 uses, and it makes chunked and mixed steps a scheduling change only.
+  - Each entry carries its token ids, block table, start position, sampling parameters, and a
+    `sample` flag (false only for a non-final prefill chunk). The runner needs nothing else, so a
+    scripted plan can drive it in tests.
+  - `schedule()` allocates and preempts; `update()` advances `num_computed_tokens`, appends
+    sampled tokens, checks EOS before `max_tokens`, and frees finished sequences.
+  - Prefill-priority with mixed batching off: whenever the head of the waiting queue can be
+    admitted, the step is prefill-only; admission is strict FIFO and stops at the first request
+    that does not fit (`max_num_seqs`, token budget, or blocks minus the watermark). A prompt
+    longer than the budget runs alone. Otherwise all running sequences decode.
+  - Preemption victim: the most recently admitted running sequence not already in the step; if
+    none is left, the sequence that needs the block preempts itself. Preempted sequences return to
+    the front of the waiting queue in admission order, keeping their generated tokens.
+  - The watermark applies to admission only. Decodes may use the reserve.
+  - `add()` rejects a request that could not finish when running alone (prompt + `max_tokens`
+    over `max_model_len`, or more blocks than the pool minus the watermark).
+- **Why the `add()` check matters:** with newest-first preemption, the oldest running sequence is
+  never a victim while others exist, and a request that fits alone always completes once it is the
+  only one left. Without the check, a request too large for the pool would be admitted, preempt
+  everyone, then preempt itself forever.
+- **Evidence:** `tests/unit/test_scheduler.py`. A test runner keeps its own per-sequence record of
+  computed positions and checks each entry continues exactly where that record ends; generated
+  tokens depend on the whole history, so any wrong recompute changes the output and fails the
+  comparison with a reference produced without a scheduler. 15 random workloads with small block
+  pools (including preemptions) must all match the reference.
+
+### Continuous integration
+- **Decision:** One GitHub Actions job on every push and pull request (`.github/workflows/ci.yml`):
+  `uv sync --frozen`, `ruff check`, `ruff format --check`, `mypy src`, `pytest -m "not gpu"` on
+  `ubuntu-24.04` with Python 3.12.
+- **Pins:** uv 0.11.6, the version that wrote `uv.lock`, so the lockfile is read exactly as written.
+  Third-party actions are pinned by commit SHA with the release tag in a comment, so a moved tag
+  cannot change what runs. `--frozen` fails the job if `uv.lock` is out of date instead of
+  silently re-resolving.
+- **Why CPU-only:** the lockfile resolves `torch==2.10.0+cpu` from the PyTorch CPU index on Linux and
+  contains no CUDA packages, so the job installs no GPU libraries and downloads no model weights.
+  GPU tests run on Modal by hand.
+- **Not added yet:** a tokenizer cache. When a test needs the Qwen3 tokenizer, it will be cached by
+  its pinned revision.
+
+### Qwen3 forward over a flat token batch
+- **Context:** One step can mix prefills of different lengths and single-token decodes. The model
+  must not care which is which.
+- **Decision:**
+  - The model takes `input_ids [T]` and `positions [T]` for all tokens of the step concatenated,
+    and returns hidden states `[T, hidden]`. Everything except attention is per token, so
+    sequences only matter inside attention.
+  - The attention backend is passed into `forward` explicitly (an `AttentionBackend` callable
+    taking the layer index and that layer's Q, K, V). nano-vllm uses a module-level global context
+    instead; passing it makes the dependency visible and lets tests substitute a simple dense
+    attention.
+  - Logits are computed separately (`compute_logits`) and only for rows that will be sampled,
+    because the vocabulary projection (151,936 columns for Qwen3-0.6B) is wasted on prefill
+    positions whose output is never used.
+  - The arithmetic follows Hugging Face transformers' Qwen3 module operation by operation:
+    RMSNorm statistics in fp32, per-head q/k RMSNorm before RoPE, RoPE angles computed on the fly
+    from `positions * inv_freq`, SwiGLU MLP, tied embeddings. Parameter names match the
+    checkpoint, so weights load by name with no mapping table.
+  - RoPE inverse frequencies are kept as a plain fp32 tensor rather than a module buffer, so
+    casting the model to bf16 does not round them.
+  - The loader fails on any missing, unexpected, or mis-shaped tensor instead of skipping it.
+- **Correctness contract:** against HF (`attn_implementation="eager"`, fp32) on a tiny random
+  Qwen3 (3 layers, hidden 64, 4 query heads, 2 KV heads, head dim 32, so heads × head_dim ≠ hidden
+  as in the real model), the predicted token at every position must be identical and logits must
+  pass `torch.testing.assert_close` at its default fp32 tolerances. Norm weights are randomised
+  in the test model so a norm that fails to load cannot hide behind its default value of 1.
+- **Observed:** a single sequence gives logits bitwise identical to HF on the development machine;
+  flattening several sequences into one batch changes the last bits (max difference 1.5e-6),
+  because matrix multiplications of different shapes accumulate in different orders. The
+  predicted tokens do not change. Bitwise equality is not part of the contract, since it depends
+  on the CPU's math library.
+- **Evidence:** `tests/unit/test_qwen3_model.py`. Seven deliberate bugs (RoPE sign, missing q
+  norm, RoPE skipped on keys, missing residual, RMSNorm epsilon outside the square root, missing
+  final norm, wrong RoPE frequencies) each fail it. The epsilon bug leaves greedy tokens
+  unchanged and is caught only by the logit comparison, which is why both checks are kept.
+
+### KV cache layout, slot mapping, and the reference paged attention
+- **Layout:** one tensor `[num_layers, 2, num_blocks, block_size, num_kv_heads, head_dim]`
+  (index 0 = K, 1 = V). Per layer, the `[num_blocks, block_size, Hkv, D]` part is exactly the
+  paged layout FlashAttention-2 takes with a `block_table`, so both backends read the same memory.
+  A *slot* is `block_id * block_size + offset`; writes go through a flat
+  `[num_blocks * block_size, Hkv, D]` view with `index_copy_`, one call for K and one for V per
+  layer, no custom kernel.
+- **Per-step metadata, built once and shared by all layers:** `slot_mapping` (where each new
+  token's K/V goes), `cu_seqlens_q` (which query rows belong to which segment), `seq_lens`
+  (context length per segment = start position + new tokens), padded `block_tables`, and the
+  longest query and context lengths. These are the same arguments FlashAttention's varlen call
+  takes, so the GPU backend can reuse them unchanged.
+- **Reference backend (`torch_ref`):** writes the new K/V first, then, per segment, gathers the
+  whole context from the cache through the block table and runs causal attention with the mask
+  aligned to the end of the context (query `j` of a segment that starts at position `s` sees keys
+  `0 .. s + j`). It never reads keys or values from its arguments. A Python loop over segments
+  makes it slow; it exists for exact CPU tests and as a cross-check of the GPU backend.
+- **Evidence:** `tests/unit/test_paged_attention.py`:
+  - attention alone against dense attention on the full sequence: prefills at block boundaries
+    (block size 4 with lengths 3/4/5/7/8/9, block size 256 with 255/256/257), a prefill split into
+    chunks that start mid-block, token-by-token decode, one call mixing a chunk continuation, a
+    decode, and a fresh prefill, and two sequences on interleaved, non-contiguous blocks where
+    every block the checked sequence does not own is overwritten with 1e4 before its last step;
+  - the tiny Qwen3 with paged attention against Hugging Face in fp32: prefill then decode (prompts
+    of 3, 4, 5, 9 tokens on scattered blocks), a 23-token prompt prefilled in three chunks, and
+    two sequences decoded together on interleaved blocks. Generated tokens equal HF `generate()`
+    and every row's logits match HF's within the default fp32 tolerances.
+  - Twelve deliberate bugs (slot offset, slot block index, K/V halves swapped, causal mask not
+    shifted by the start position, mask off by one, context missing the newest token, wrong GQA
+    head mapping, missing 1/sqrt(d), reading new K from the argument, wrong `seq_lens`,
+    non-cumulative `cu_seqlens`, accepting a too-short block table) each fail at least one test.
+    The unshifted mask and the argument-read bug only show up in chunk and decode cases, where a
+    segment starts after position 0.
+- **Near-ties:** the smallest top-1 minus top-2 logit gap of the reference over every compared
+  position is 1.2e-3 (printed by the test run), about a hundred times larger than fp32 rounding
+  noise. If a later scenario flips a token, the gap at that position decides: near 1e-5 means a
+  near-tie on the random model and the strict suite moves to float64; a large gap means a bug.
+
+### Model runner
+- **Decision:** The runner takes a `SchedulerOutput` and nothing else. For each entry it appends
+  the entry's tokens to one flat batch, gives each token its position in its own sequence, adds a
+  segment (start position, token count, block table) to the attention metadata, and, if the entry
+  samples, remembers the batch row of the entry's last token. After the forward pass it computes
+  logits for those rows only and returns them with their sequence ids. Sampling is a separate
+  step.
+- **Why it knows so little:** whether an entry is a prefill, a chunk, a decode, or a recompute
+  after preemption is invisible to it; all four are "compute these positions for this sequence".
+  So the scheduling policy can change (mixed batching in Phase 3) without touching the runner.
+- **Non-sampled entries still run:** a non-final prefill chunk produces no logits but its K/V are
+  written, which the next chunk needs.
+- **Attention backend as a factory:** the runner builds a backend per step from the cache and
+  that step's metadata. The PyTorch reference is the default; the FlashAttention backend plugs in
+  the same way.
+- **Tested before the real scheduler existed in the engine:** a scripted scheduler under `tests/`
+  replays hand-written plans (start, count, block table, sample flag) with HF's greedy
+  continuation as the tokens, so each sampled row must predict HF's next token and match HF's
+  logits at that position. Plans cover prefill then decode, a prompt in three chunks where the
+  first two do not sample, one step mixing a chunk continuation, a decode, and a fresh prefill,
+  and a recompute: after some decodes the same sequence is prefilled again from position 0 into
+  different blocks while its old blocks are overwritten with garbage.
+
+### Sampler
+- **Decision:** One sampler per engine with its own seeded `torch.Generator`. Per row:
+  temperature 0 is greedy (`argmax`, ties to the lowest id, as Hugging Face); otherwise logits are
+  divided by the temperature and turned into probabilities in fp32, nucleus (top-p) filtering
+  keeps every token whose more-likely tokens hold less than `top_p` of the mass (so the most
+  likely token is always kept and the kept set is the smallest reaching `top_p`), and one token is
+  drawn with `torch.multinomial` from the filtered weights.
+- **Why fp32:** with bf16 logits the softmax of a 151,936-way distribution loses most small
+  probabilities to rounding; computing it in fp32 costs little because it runs on the sampled rows
+  only.
+- **Why a per-engine generator:** a fixed seed makes a whole run reproducible for debugging, and
+  greedy rows consume no random numbers, so adding a greedy request does not change the draws of
+  sampled ones. Per-request seeds are deferred along with the `seed` API parameter.
+- **Not implemented:** top-k, min-p, repetition and frequency penalties, logprobs.
+- **Evidence:** `tests/unit/test_sampler.py` checks greedy and ties, that greedy draws no random
+  numbers, frequencies against the expected softmax at temperature 1 and 0.5 (20,000 draws,
+  tolerance 0.015, about four standard deviations), the top-p kept set at boundary values and in
+  shuffled token order, that sampling never leaves the nucleus, reproducibility by seed, and mixed
+  greedy and random rows. Nine deliberate bugs each fail at least one test.
+
+### Synchronous engine
+- **Decision:** `LLMEngine` owns the model, KV cache, block manager, scheduler, runner, and
+  sampler, built from one frozen `EngineConfig` validated at construction (block count, block
+  size, dtype, backend; the flash backend requires a block size divisible by 256 and is not
+  available yet). `step()` = schedule, run, sample, update; it returns one `StepOutput` (sequence,
+  token, finished, reason) per sequence that produced a token. `generate()` is an offline
+  convenience that runs prompts to completion. Requests are token ids in and out; tokenizers and
+  chat templates belong to the API layer.
+- **KV cache size is explicit for now** (`num_blocks`). Sizing it from free GPU memory after a
+  profiling forward pass comes with the GPU backend, where it can be measured.
+- **Block size:** the engine default is 256 (FlashAttention-2's requirement). The reference
+  backend accepts any size, and the CPU tests use 4 so short prompts cross many block
+  boundaries; the same code paths run either way.
+- **Counters:** steps and preemptions are counted on the engine so tests (and later metrics) can
+  assert that a scenario really preempted.
+- **Evidence:** `tests/unit/test_engine.py`. A first mutation pass found that swapping which
+  sequence a sampled token or a sampling setting belongs to went unnoticed, because no engine test
+  ran several requests in one step; two tests were added (a batch of greedy requests against HF,
+  and a greedy request decoded in the same steps as a temperature-5 request), after which all six
+  deliberate bugs fail at least one test.
+- **No-progress guard (added after the end-to-end mutation run):** if the scheduler returns an
+  empty plan while requests are still waiting or running, `step()` raises instead of returning
+  nothing. With a correct scheduler and block manager this cannot happen (admission control
+  guarantees the oldest request fits once nothing else holds blocks); without the guard, a block
+  leak made `generate()` loop forever, which a test run only reported as a timeout.
+
+### End-to-end correctness with the real scheduler and block manager
+- **Scenarios** (`tests/integration/test_engine_vs_hf.py`, tiny Qwen3, fp32, PyTorch paged
+  attention, block size 4), each compared token for token with Hugging Face greedy `generate()`:
+  a single request; eight requests of 1 to 20 tokens at once; requests arriving at steps 0, 3, 7,
+  and 12 while others decode; forced preemption (10 blocks, four requests that may each reach
+  17 tokens, with watermark 0 and 0.2; at least one preemption asserted, two observed in each);
+  prompts of 3, 4, 5, 7, 8, 9 tokens (block size minus one, equal, plus one, around one and two
+  blocks), alone and together; a token budget of 8 with at most 2 running, so a 20-token prompt
+  runs alone; and five random workloads with 8 to 14 blocks (11 preemptions observed across them).
+  Every run must end with all blocks free.
+- **Result:** all token-exact; no token flipped, so the strict suite stays in fp32.
+- **Smallest reference gap** (top-1 minus top-2 logit over every compared position, all tests):
+  1.9e-4, in the token-budget scenario; about 18 times the ~1e-5 near-tie threshold.
+- **The end-to-end tests catch component bugs on their own:** replaying earlier mutants against
+  this file only, a preemption that keeps `num_computed_tokens`, an oldest-first victim, a decode
+  that reserves one slot too few, scheduler entries missing the last token, block counts rounded
+  down, per-entry positions starting at 0, and a block leak all fail it. The leak first showed up
+  as a hang, which led to the engine's no-progress guard.
