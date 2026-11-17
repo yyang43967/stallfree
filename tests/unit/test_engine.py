@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -16,10 +17,26 @@ from stallfree.sequence import FinishReason, SamplingParams
 BS = 4
 
 
+# Every scenario in this file runs with mixed batching off and on; assertions are the same.
+MODE: dict[str, bool] = {"mixed": False}
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["off", "on"])
+def batching_mode(request: pytest.FixtureRequest) -> Iterator[None]:
+    MODE["mixed"] = request.param
+    yield
+    MODE["mixed"] = False
+
+
 def make_engine(model_dir: Path, num_blocks: int = 64, **sched: object) -> LLMEngine:
     scheduler = SchedulerConfig(
-        max_num_seqs=8, max_num_batched_tokens=64, max_model_len=256, watermark=0.0, **sched
-    )  # type: ignore[arg-type]
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+        max_model_len=256,
+        watermark=0.0,
+        enable_mixed_batching=MODE["mixed"],
+        **sched,  # type: ignore[arg-type]
+    )
     cfg = EngineConfig(
         model=str(model_dir),
         num_blocks=num_blocks,

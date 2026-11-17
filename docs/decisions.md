@@ -744,3 +744,58 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   reply contains a `<think>...</think>` block before the answer. GPU Reserve sends no temperature, so
   the OpenAI default of 1.0 applies and its `invoke` and `stream` texts differ. Tool calling stays
   out of scope.
+
+## Phase 3 — Stall-free mixed batching
+
+### Mixed-batching scheduler
+- **Policy** (`enable_mixed_batching=True`; full statement in `scheduler.py`): each step has a
+  strict token budget and three passes. (1) Every running sequence with one uncomputed token
+  (a decode, or the last one-token piece of a chunked prefill) gets it, oldest first, with the
+  same newest-first preemption as before. (2) Prefills already in progress continue, oldest first,
+  with `min(uncomputed, budget left)` tokens. (3) Waiting sequences are admitted in strict FIFO
+  order with a first chunk sized to the budget left and to the free blocks minus the watermark.
+  This is Sarathi-Serve's stall-free batching: decodes are never held back by a prefill, and a
+  long prompt is spread over several steps that each also carry every decode.
+- **Shortage during a continuation:** take blocks from the newest running sequence not yet in the
+  step; if there is none, shrink the chunk to what fits in the sequence's own last block and the
+  free blocks; only if nothing fits does it preempt itself. Shrinking avoids a recompute: in the
+  tested scenario it completes with no preemption where giving up would have preempted once.
+- **No admissions in a step that preempted:** a preempted sequence goes to the front of the waiting
+  queue, and pass 3 would otherwise readmit it into the blocks it just released.
+- **Invariant that makes one guard redundant:** a sequence in the middle of its prefill is always
+  newer than every sequence that is decoding. An older prefill takes all the budget left in
+  pass 2 unless it finishes, so a newer request cannot complete its prefill first; the exception,
+  a chunk shrunk for lack of blocks, only happens when there is no newer unscheduled sequence.
+  So when pass 2 looks for a victim, no already-scheduled sequence can come after the current one.
+  The "not already scheduled" check in the victim search is kept as a defensive guard; the mutant
+  that removes it is the one survivor of the mixed-mode mutation run, for this reason.
+- **Off mode is unchanged:** every off-mode scheduler test passes as before; the only edit to that
+  file replaced the test asserting mixed mode was unimplemented with one that it constructs and
+  schedules.
+- **Evidence:** `tests/unit/test_scheduler_mixed.py` (26 tests): step-by-step plans for the policy,
+  the SPEC test (three decodes keep running every step while a 40-token prompt is fed in 5-token
+  chunks under a budget of 8), FIFO with a partial chunk filling leftover budget, a budget smaller
+  than every prompt, `max_num_seqs` counting partial prefills, the watermark shrinking an admitted
+  chunk, chunk shrinking instead of preempting, and 15 random workloads with small caches checked
+  against a scheduler-free reference, which include preemptions in the middle of a prefill. Twelve
+  deliberate bugs: eleven fail at least one test; the remaining one is the redundant guard above.
+
+### Queue time with chunked prefill
+- **Definition:** `queue_s` runs from arrival to the start of the first step that scheduled any
+  token of the request (its first chunk, or its whole prefill with mixed batching off). TTFT still
+  ends at the first generated token, which with chunked prefill comes from the last chunk, so
+  `ttft_s - queue_s` is the time spent prefilling. With mixed batching off the two definitions
+  coincide, since the first scheduled step is the prefill that produces the first token.
+- **Mechanism:** the engine records which sequences each step scheduled
+  (`last_scheduled_seq_ids`); the async loop reads it between steps.
+- **Evidence:** with an 8-token budget and 20 ms steps, a 40-token prompt is scheduled in the
+  first step after arrival (`queue_s` < 20 ms) and its first token comes about four steps later.
+
+### End-to-end correctness with mixed batching on
+- The engine unit tests and the end-to-end file run every scenario with mixed batching off and on
+  (an autouse fixture with ids `off`/`on`; assertions unchanged): 39 existing tests per mode, all
+  token-exact against Hugging Face in fp32, including forced preemption with an asserted
+  preemption and lengths at block boundaries ±1.
+- New end-to-end scenarios: every prompt chunked (budget 4, prompts of 5 to 20 tokens) and
+  preemption in the middle of a chunked prefill (asserted to happen with mixed batching on), both
+  token-exact. The smallest reference top-1/top-2 gap over the whole run stays at 1.9e-4.

@@ -94,6 +94,8 @@ class LLMEngine:
         self._ids = count()
         self.num_steps = 0
         self.num_preemptions = 0
+        # Sequences that had an entry in the most recent step (any chunk, decode, or recompute).
+        self.last_scheduled_seq_ids: tuple[int, ...] = ()
 
     def add_request(
         self,
@@ -117,6 +119,7 @@ class LLMEngine:
         """Run one step. Returns one output per sequence that produced a token, in batch order."""
         plan = self.scheduler.schedule()
         self.num_preemptions += len(plan.preempted_seq_ids)
+        self.last_scheduled_seq_ids = tuple(e.seq_id for e in plan.entries)
         if plan.is_empty:
             if self.scheduler.has_unfinished():
                 # Cannot happen with a correct scheduler and block manager: admission control

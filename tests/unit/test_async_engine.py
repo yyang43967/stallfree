@@ -302,3 +302,45 @@ def test_event_loop_keeps_running_while_a_step_runs(tiny_model_dir: Path) -> Non
     ticks, off_main = run(main())
     assert off_main, "step must run off the event-loop thread"
     assert ticks >= 20, f"event loop ticked only {ticks} times during ~0.4 s of steps"
+
+
+def test_queue_time_ends_at_the_first_chunk_with_mixed_batching(
+    tiny_model_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 40-token prompt with an 8-token budget is prefilled over 5 steps; queue time stops at the
+    first of them, so time to first token exceeds it by about four 20 ms steps."""
+    cfg = EngineConfig(
+        model=str(tiny_model_dir),
+        num_blocks=64,
+        block_size=BS,
+        dtype="float32",
+        scheduler=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=8,
+            max_model_len=256,
+            watermark=0.0,
+            eos_token_id=None,
+            enable_mixed_batching=True,
+        ),
+    )
+
+    async def main() -> None:
+        ae = AsyncEngine(LLMEngine(cfg))
+        real_step = ae.engine.step
+
+        def slow_step() -> list[object]:
+            time.sleep(0.02)
+            return real_step()  # type: ignore[return-value]
+
+        ae.engine.step = slow_step  # type: ignore[method-assign]
+        await ae.start()
+        try:
+            await collect(ae, prompt(40, 14), greedy(2))
+        finally:
+            await ae.stop()
+
+    with caplog.at_level(logging.INFO, logger="stallfree.metrics"):
+        run(main())
+    (rec,) = [json.loads(r.getMessage()) for r in caplog.records if r.name == "stallfree.metrics"]
+    assert rec["queue_s"] < 0.02, "scheduled in the first step after arrival"
+    assert rec["ttft_s"] - rec["queue_s"] >= 4 * 0.02 * 0.9

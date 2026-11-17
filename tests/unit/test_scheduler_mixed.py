@@ -255,6 +255,27 @@ def test_eos_and_length_still_finish_sequences() -> None:
     assert seq.output_token_ids == [EOS] and seq.finish_reason is FinishReason.STOP
 
 
+def test_chunk_shrinks_to_its_own_room_instead_of_preempting() -> None:
+    """The newest sequence, mid-prefill, with no free block and nobody newer to preempt, takes a
+    smaller chunk that fits in the blocks it already holds instead of giving them all up."""
+    sim = MixedSim(4, max_num_seqs=4, budget=4)
+    sim.add(make_seq(0, 2, max_tokens=6))
+    for _ in range(3):
+        sim.step()
+    sim.add(make_seq(1, 9, max_tokens=1))
+    assert entries(sim.step()) == [(0, 4, 1), (1, 0, 3)]
+    assert entries(sim.step()) == [(0, 5, 1), (1, 3, 3)]
+    assert sim.bm.num_free_blocks == 0
+    # Seq 1 wants 3 more tokens (a third block); none is free, so it takes the 2 that fit.
+    assert entries(sim.step()) == [(0, 6, 1), (1, 6, 2)]
+    sim.run()
+    assert sim.preemptions == 0
+    for seq in sim.seqs.values():
+        assert seq.output_token_ids == reference_output(
+            seq.prompt_token_ids, seq.sampling_params.max_tokens
+        )
+
+
 # --- preemption -----------------------------------------------------------------------------
 
 

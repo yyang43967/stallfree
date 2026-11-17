@@ -12,8 +12,9 @@ the request is aborted and its KV blocks are freed at the next step boundary.
 Backpressure: at most ``max_queued_requests`` requests may be in the system at once; beyond that
 ``generate`` raises ``QueueFullError`` immediately, and the API turns it into a 503.
 
-Metrics: when a request ends, one structured log line records its queue time, time to first
-token, time per output token, and end-to-end latency, measured on the server's monotonic clock.
+Metrics: when a request ends, one structured log line records its queue time (arrival to the
+start of the first step that scheduled any of its tokens), time to first token, time per output
+token, and end-to-end latency, measured on the server's monotonic clock.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ class _Request:
     queue: asyncio.Queue[StepOutput | BaseException] = field(default_factory=asyncio.Queue)
     seq_id: int | None = None
     arrival: float = field(default_factory=time.monotonic)
-    first_step_start: float | None = None  # start of the step that produced the first token
+    first_scheduled: float | None = None  # start of the first step that scheduled any token
     first_token: float | None = None
     last_token: float | None = None
     num_tokens: int = 0
@@ -154,6 +155,7 @@ class AsyncEngine:
                     continue
                 step_start = time.monotonic()
                 outputs = await asyncio.to_thread(self.engine.step)
+                self._note_scheduled(step_start)
                 self._deliver(outputs, step_start)
         except BaseException as exc:
             self._error = exc
@@ -181,6 +183,13 @@ class AsyncEngine:
                     self._by_seq.pop(req.seq_id, None)
                 self._finish(req, FinishReason.ABORT.value)
 
+    def _note_scheduled(self, step_start: float) -> None:
+        """Record when each request was first scheduled (its first chunk, with mixed batching)."""
+        for seq_id in self.engine.last_scheduled_seq_ids:
+            req = self._by_seq.get(seq_id)
+            if req is not None and req.first_scheduled is None:
+                req.first_scheduled = step_start
+
     def _deliver(self, outputs: list[StepOutput], step_start: float) -> None:
         now = time.monotonic()
         for out in outputs:
@@ -188,7 +197,7 @@ class AsyncEngine:
             if req is None or req.done:
                 continue  # aborted while this step ran
             if req.first_token is None:
-                req.first_step_start, req.first_token = step_start, now
+                req.first_token = now
             req.last_token = now
             req.num_tokens += 1
             req.queue.put_nowait(out)
@@ -226,8 +235,9 @@ class AsyncEngine:
             "completion_tokens": req.num_tokens,
             "e2e_s": round(end - req.arrival, 6),
         }
-        if req.first_token is not None and req.first_step_start is not None:
-            record["queue_s"] = round(req.first_step_start - req.arrival, 6)
+        if req.first_scheduled is not None:
+            record["queue_s"] = round(req.first_scheduled - req.arrival, 6)
+        if req.first_token is not None:
             record["ttft_s"] = round(req.first_token - req.arrival, 6)
             if req.num_tokens > 1 and req.last_token is not None:
                 record["tpot_s"] = round(

@@ -9,7 +9,9 @@ summary.
 from __future__ import annotations
 
 import random
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from helpers.tiny_qwen3 import TINY_CONFIG, hf_greedy, hf_logits, record_gap
@@ -20,6 +22,17 @@ from stallfree.engine import LLMEngine
 from stallfree.sequence import SamplingParams
 
 BS = 4
+
+
+# Every scenario in this file runs with mixed batching off and on; assertions are the same.
+MODE: dict[str, bool] = {"mixed": False}
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["off", "on"])
+def batching_mode(request: pytest.FixtureRequest) -> Iterator[None]:
+    MODE["mixed"] = request.param
+    yield
+    MODE["mixed"] = False
 
 
 def make_engine(
@@ -36,6 +49,7 @@ def make_engine(
         max_model_len=512,
         watermark=watermark,
         eos_token_id=None,
+        enable_mixed_batching=MODE["mixed"],
     )
     cfg = EngineConfig(
         model=str(model_dir),
@@ -199,3 +213,48 @@ def test_random_workload_with_small_cache(
         tiny_hf_model, prompts, [outputs[i] for i in ids], max_tokens, "e2e random workload"
     )
     assert engine.block_manager.num_free_blocks == engine.block_manager.num_blocks
+
+
+# --- scenarios specific to mixed batching (still run in both modes; the mid-prefill preemption
+# assertion only applies when prefills are chunked) --------------------------------------------
+
+
+def test_budget_smaller_than_every_prompt(
+    tiny_model_dir: Path, tiny_hf_model: HFQwen3ForCausalLM
+) -> None:
+    engine = make_engine(tiny_model_dir, max_num_seqs=4, max_num_batched_tokens=4)
+    prompts = [prompt(n, seed=700 + n) for n in (5, 9, 13, 20)]
+    outs = engine.generate(prompts, params(6))
+    check_against_hf(tiny_hf_model, prompts, outs, [6] * 4, "e2e chunked")
+
+
+def test_preemption_during_chunked_prefill(
+    tiny_model_dir: Path, tiny_hf_model: HFQwen3ForCausalLM
+) -> None:
+    mid_prefill: list[tuple[int, int, int]] = []
+    total = 0
+    for seed in range(6):
+        rng = random.Random(900 + seed)
+        engine = make_engine(
+            tiny_model_dir,
+            num_blocks=rng.randint(7, 10),
+            max_num_seqs=4,
+            max_num_batched_tokens=rng.choice([4, 6, 8]),
+        )
+        real_preempt = engine.scheduler._preempt
+
+        def spy(seq: Any, real: Any = real_preempt) -> None:
+            if 0 < seq.num_computed_tokens < seq.num_prompt_tokens:
+                mid_prefill.append((seq.seq_id, seq.num_computed_tokens, seq.num_prompt_tokens))
+            real(seq)
+
+        engine.scheduler._preempt = spy  # type: ignore[method-assign]
+        prompts = [prompt(rng.randint(8, 18), seed=1000 * seed + i) for i in range(4)]
+        max_tokens = [rng.randint(4, 10) for _ in range(4)]
+        outs = engine.generate(prompts, [params(n) for n in max_tokens])
+        total += engine.num_preemptions
+        check_against_hf(tiny_hf_model, prompts, outs, max_tokens, "e2e chunked preemption")
+        assert engine.block_manager.num_free_blocks == engine.block_manager.num_blocks
+    assert total > 0
+    if MODE["mixed"]:
+        assert mid_prefill, "no sequence was preempted in the middle of a chunked prefill"
