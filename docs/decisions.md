@@ -715,3 +715,29 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   `chat_template_kwargs` change the prompt, unsupported parameters get a 400 naming them, a
   disconnect mid-stream frees all blocks and stops generation, a full server answers 503 (JSON and
   streaming), and `ignore_eos` overrides an end-of-sequence token the model actually produces.
+
+### Serving on Modal and the GPU checks
+- **Endpoint:** `modal_apps/serve.py` serves the FastAPI app as a Modal ASGI app (flash backend,
+  bf16, cache sized automatically, one container, up to 256 concurrent requests per container,
+  scaled to zero after 60 idle seconds). The bearer key is read from the local environment when
+  the app is created and attached as an ephemeral secret, so no named secret is stored in the
+  workspace. For the checks below it ran under `modal serve` (a temporary URL that disappears
+  when the command ends) rather than `modal deploy`. Stopping the local `modal serve` process left
+  the app "ephemeral" until `modal app stop -y` was run; the session checklist now ends with that
+  and `modal app list`.
+- **GPU concurrency run** (`docs/data/concurrency_gpu.json`, NVIDIA A10): the real server with the
+  Qwen3 tokenizer, eight `openai` async clients streaming at once (greedy, up to 64 tokens,
+  thinking off). Eight distinct response ids, one per stream, every stream with a finish reason
+  and correct usage. Content against Hugging Face bf16 greedy under the margin rule: five
+  identical, three diverging at gaps 0.25, 0.25, and 0.125 (the same prompts and positions as in
+  the single-request margin suite), all passing.
+- **GPU Reserve compatibility** (`docs/data/gpu_reserve_check.json`): `scripts/gpu_reserve_check.py`,
+  run with GPU Reserve's own Python, builds its chat model through its unmodified provider code
+  (`ASSISTANT_MODEL=vllm:Qwen/Qwen3-0.6B`, a LangChain `ChatOpenAI` on chat completions with
+  `stream_usage`) with only the base URL and key pointing here, from an empty directory so its
+  `.env` is never read. With thinking off, `invoke` and `stream` both return "The capital of France
+  is Paris." with no reasoning; the prompt is 4 tokens longer than with thinking on (the empty think
+  block the template adds), so `chat_template_kwargs` reached the template. With thinking on, the
+  reply contains a `<think>...</think>` block before the answer. GPU Reserve sends no temperature, so
+  the OpenAI default of 1.0 applies and its `invoke` and `stream` texts differ. Tool calling stays
+  out of scope.

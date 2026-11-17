@@ -188,6 +188,19 @@ def run_calibration_and_margin() -> dict[str, Any]:
     }
 
 
+@app.function(**GPU_FN, timeout=1800)  # type: ignore[arg-type]
+def run_concurrency() -> dict[str, Any]:
+    import sys
+
+    start = time.time()
+    sys.path.insert(0, "/root")
+    from tests.gpu.concurrency import run_concurrency_check
+
+    result = run_concurrency_check(MODEL_DIR)
+    result["seconds"] = round(time.time() - start, 1)
+    return result
+
+
 @app.local_entrypoint()
 def download() -> None:
     print(download_weights.remote())
@@ -232,3 +245,17 @@ def calibrate_and_margin(gpu: str = "A10") -> None:
         )
     print(r["output"])
     print(f"gpu={r['gpu']} returncode={r['returncode']} seconds={r['seconds']}")
+
+
+@app.local_entrypoint()
+def concurrency(gpu: str = "") -> None:
+    fn = run_concurrency.with_options(gpu=gpu) if gpu else run_concurrency
+    r = fn.remote()
+    Path("docs/data/concurrency_gpu.json").write_text(json.dumps(r, indent=2) + "\n")
+    ok = all(x["passes"] and x["one_response_id"] and x["usage_ok"] for x in r["results"])
+    print(
+        f"gpu={r['gpu']} clients={r['clients']} distinct ids={r['distinct_response_ids']} "
+        f"all checks pass={ok} seconds={r['seconds']}"
+    )
+    for x in r["results"]:
+        print(x)

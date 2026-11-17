@@ -29,6 +29,10 @@ PINNED = [
     "huggingface-hub==2.4.0",
     "numpy==2.5.5",
     "pytest==9.2.0",
+    "fastapi==0.163.2",
+    "uvicorn==0.54.0",
+    "openai==3.53.0",
+    "httpx==0.28.1",
 ]
 
 weights_volume = modal.Volume.from_name("stallfree-weights", create_if_missing=True)
