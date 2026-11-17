@@ -27,6 +27,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # Tokenizer files only (no weights) for the chat-template tests, keyed by the pinned revision.
+      - name: Cache Qwen3 tokenizer
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B
+          key: hf-qwen3-0.6b-tokenizer-c1899de289a04d12100db370d81485cdf75e47ca
+
       # torch resolves from the PyTorch CPU index on Linux (pyproject.toml), so no CUDA wheels.
       - name: Install dependencies
         run: uv sync --frozen

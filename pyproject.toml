@@ -10,12 +10,15 @@ dependencies = [
     "torch==2.10.0",
     "transformers==5.23.0",
     "safetensors",
+    "fastapi>=0.163.2",
+    "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]
 dev = [
     "modal==1.6.4",
     "mypy",
+    "openai>=3.53.0",
     "pytest",
     "ruff",
 ]

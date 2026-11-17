@@ -623,3 +623,30 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   above.
 - **KV sizing in that run:** 509 blocks (13.92 GiB), lower than the smoke run's 649 because the
   Hugging Face reference model was still resident in the same process (5.81 GiB in use).
+
+## Phase 2 — Online serving
+
+### API protocol, chat templates, and incremental text
+- **Request handling:** `/v1/chat/completions` accepts the OpenAI fields this server can honour
+  (`model`, `messages`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `stream`,
+  `stream_options.include_usage`) plus vLLM's `chat_template_kwargs` and `ignore_eos`. Fields that
+  would change the response but are not implemented (`n > 1`, `stop`, `seed`, `tools`,
+  `tool_choice` other than "none", `logprobs`, `top_logprobs`, `response_format`, non-zero
+  penalties, `logit_bias`) are rejected with an OpenAI-shaped 400 naming them, so a client never
+  silently gets something it did not ask for. Other unknown fields are ignored, as OpenAI-
+  compatible servers commonly do.
+- **Tokenizer boundary:** the engine stays token ids in and out. A small `ChatTokenizer` interface
+  (render a chat with the model's template and tokenize it; decode without special tokens) has a
+  Hugging Face implementation for serving and a byte-level stub for CPU tests whose 256 ids match
+  the tiny model's vocabulary, so API tests need no tokenizer download. `chat_template_kwargs` go
+  straight to the template; with Qwen3, `enable_thinking=False` pre-fills an empty think block.
+- **Incremental decoding:** each new token decodes a short window ending at it and emits only the
+  text past what was already sent; a window ending in an incomplete UTF-8 character emits nothing
+  until a later token completes it. Concatenated deltas equal the full decode (tested with random
+  multi-byte text and with Qwen3's tokenizer), and no partial character is ever sent.
+- **Admission check before streaming:** `Scheduler.validate()` holds the "could this request ever
+  finish alone" check from `add()`. It reads only constants, so the API can reject an impossible
+  request with a 400 before the stream starts, without touching scheduler state while a step runs
+  in the worker thread. The scheduler's contract tests pass unchanged.
+- **CI:** the Qwen3 tokenizer files (no weights) are cached by the pinned revision for the
+  chat-template tests.
