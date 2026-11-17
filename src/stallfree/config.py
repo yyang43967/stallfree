@@ -53,7 +53,7 @@ DTYPES = ("float32", "bfloat16", "float16")
 
 class AttentionBackendName(Enum):
     TORCH_REF = "torch_ref"  # plain PyTorch, any device; correctness reference
-    FLASH = "flash"  # FlashAttention-2 on GPU (not implemented yet)
+    FLASH = "flash"  # FlashAttention-2, CUDA only
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,8 +62,10 @@ class EngineConfig:
 
     Attributes:
         model: directory with ``config.json`` and ``*.safetensors``.
-        num_blocks: KV cache blocks to allocate. Set explicitly for now; sizing it from free GPU
-            memory comes with the GPU backend.
+        num_blocks: KV cache blocks to allocate. ``None`` sizes the cache from GPU memory after
+            a profiling forward pass (CUDA only); tests and CPU runs set it explicitly.
+        gpu_memory_utilization: fraction of GPU memory the engine may use in total (weights,
+            activations, and KV cache) when ``num_blocks`` is ``None``.
         block_size: tokens per KV block (256 for FlashAttention-2; any size for the reference
             backend, which tests use with small blocks).
         dtype: ``"float32"``, ``"bfloat16"``, or ``"float16"`` for weights, activations, and cache.
@@ -74,16 +76,21 @@ class EngineConfig:
     """
 
     model: str
-    num_blocks: int
+    num_blocks: int | None = None
     block_size: int = FLASH_BLOCK_SIZE_MULTIPLE
     dtype: str = "bfloat16"
     device: str = "cpu"
     attention: AttentionBackendName = AttentionBackendName.TORCH_REF
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     seed: int = 0
+    gpu_memory_utilization: float = 0.9
 
     def __post_init__(self) -> None:
-        if self.num_blocks < 1:
+        if not 0 < self.gpu_memory_utilization <= 1:
+            raise ValueError(
+                f"gpu_memory_utilization must be in (0, 1], got {self.gpu_memory_utilization}"
+            )
+        if self.num_blocks is not None and self.num_blocks < 1:
             raise ValueError(f"num_blocks must be >= 1, got {self.num_blocks}")
         if self.block_size < 1:
             raise ValueError(f"block_size must be >= 1, got {self.block_size}")

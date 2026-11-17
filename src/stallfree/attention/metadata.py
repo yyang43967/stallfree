@@ -9,6 +9,7 @@ chunk that continues an earlier one has ``start_pos > 0``.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -37,6 +38,8 @@ class AttentionMetadata:
         cu_seqlens_q: ``[B + 1]`` int32, cumulative query lengths; segment ``i`` owns query rows
             ``cu_seqlens_q[i] .. cu_seqlens_q[i+1]-1``.
         seq_lens: ``[B]`` int32, context length of each segment (``start_pos + num_new``).
+        cu_seqlens_k: ``[B + 1]`` int32, cumulative context lengths (FlashAttention's varlen
+            key boundaries; with a block table it reads keys through the cache).
         block_tables: ``[B, max_blocks]`` int32, padded with ``BLOCK_TABLE_PAD``.
         max_seqlen_q, max_seqlen_k: longest query and context length in the step.
         block_size: tokens per cache block.
@@ -45,6 +48,7 @@ class AttentionMetadata:
     slot_mapping: torch.Tensor
     cu_seqlens_q: torch.Tensor
     seq_lens: torch.Tensor
+    cu_seqlens_k: torch.Tensor
     block_tables: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
@@ -88,6 +92,9 @@ def build_attention_metadata(
         slot_mapping=torch.cat(slot_parts).to(device),
         cu_seqlens_q=torch.tensor(cu, dtype=torch.int32, device=device),
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor(
+            [0, *itertools.accumulate(seq_lens)], dtype=torch.int32, device=device
+        ),
         block_tables=tables.to(device),
         max_seqlen_q=max(s.num_new for s in segments),
         max_seqlen_k=max(seq_lens),

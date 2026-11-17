@@ -13,11 +13,14 @@ from itertools import count
 
 import torch
 
+from stallfree.attention.flash import FlashAttention
+from stallfree.attention.torch_ref import TorchRefAttention
 from stallfree.block_manager import BlockManager
 from stallfree.config import AttentionBackendName, EngineConfig
 from stallfree.kv_cache import KVCache
+from stallfree.memory import MemoryReport, profile_num_blocks
 from stallfree.model.loader import load_model
-from stallfree.model_runner import ModelRunner
+from stallfree.model_runner import AttentionFactory, ModelRunner
 from stallfree.sampler import Sampler
 from stallfree.scheduler import Scheduler
 from stallfree.sequence import FinishReason, SamplingParams
@@ -38,35 +41,56 @@ class LLMEngine:
     """Loads the model and runs continuous batching over a paged KV cache.
 
     Raises:
-        NotImplementedError: for the flash backend (not implemented yet).
-        ValueError: if ``max_model_len`` exceeds what the model supports.
+        ValueError: if the flash backend or automatic cache sizing is requested off CUDA, or
+            ``max_model_len`` exceeds what the model supports.
     """
 
     def __init__(self, config: EngineConfig) -> None:
-        if config.attention is not AttentionBackendName.TORCH_REF:
-            raise NotImplementedError(f"attention backend {config.attention.value!r}")
+        device = torch.device(config.device)
+        attention: AttentionFactory = TorchRefAttention
+        if config.attention is AttentionBackendName.FLASH:
+            if device.type != "cuda":
+                raise ValueError("the flash backend needs a CUDA device")
+            attention = FlashAttention
+        if config.num_blocks is None and device.type != "cuda":
+            raise ValueError("num_blocks must be set unless running on CUDA")
         self.config = config
         dtype: torch.dtype = getattr(torch, config.dtype)
-        self.model = load_model(config.model, dtype=dtype, device=config.device)
+        self.model = load_model(config.model, dtype=dtype, device=device)
         mcfg = self.model.config
         if config.scheduler.max_model_len > mcfg.max_position_embeddings:
             raise ValueError(
                 f"max_model_len {config.scheduler.max_model_len} exceeds the model's "
                 f"max_position_embeddings {mcfg.max_position_embeddings}"
             )
+        sched = config.scheduler
+        self.memory_report: MemoryReport | None = None
+        num_blocks = config.num_blocks
+        if num_blocks is None:
+            self.memory_report = profile_num_blocks(
+                self.model,
+                attention=attention,
+                block_size=config.block_size,
+                dtype=dtype,
+                device=device,
+                profile_tokens=max(sched.max_num_batched_tokens, sched.max_model_len),
+                sampled_rows=sched.max_num_seqs,
+                utilization=config.gpu_memory_utilization,
+            )
+            num_blocks = self.memory_report.num_blocks
         self.cache = KVCache(
             num_layers=mcfg.num_hidden_layers,
-            num_blocks=config.num_blocks,
+            num_blocks=num_blocks,
             block_size=config.block_size,
             num_kv_heads=mcfg.num_key_value_heads,
             head_dim=mcfg.head_dim,
             dtype=dtype,
-            device=config.device,
+            device=device,
         )
-        self.block_manager = BlockManager(config.num_blocks, config.block_size)
-        self.scheduler = Scheduler(config.scheduler, self.block_manager)
-        self.runner = ModelRunner(self.model, self.cache, device=config.device)
-        self.sampler = Sampler(seed=config.seed, device=config.device)
+        self.block_manager = BlockManager(num_blocks, config.block_size)
+        self.scheduler = Scheduler(sched, self.block_manager)
+        self.runner = ModelRunner(self.model, self.cache, attention=attention, device=device)
+        self.sampler = Sampler(seed=config.seed, device=device)
         self._ids = count()
         self.num_steps = 0
         self.num_preemptions = 0

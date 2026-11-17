@@ -51,10 +51,10 @@ def test_invalid_engine_config(kwargs: dict[str, object]) -> None:
         EngineConfig(**{**base, **kwargs})  # type: ignore[arg-type]
 
 
-def test_flash_backend_not_available_yet(tiny_model_dir: Path) -> None:
+def test_flash_backend_requires_cuda(tiny_model_dir: Path) -> None:
     flash = AttentionBackendName.FLASH
     cfg = EngineConfig(model=str(tiny_model_dir), num_blocks=8, attention=flash)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="CUDA"):
         LLMEngine(cfg)
 
 
@@ -166,3 +166,43 @@ def test_step_fails_loudly_when_nothing_can_run_but_requests_wait(tiny_model_dir
     engine.block_manager.allocate(seq_id=999, num_tokens=16)  # simulate leaked blocks
     with pytest.raises(RuntimeError, match="no progress"):
         engine.step()
+
+
+def test_automatic_cache_sizing_requires_cuda(tiny_model_dir: Path) -> None:
+    cfg = EngineConfig(model=str(tiny_model_dir), num_blocks=None, block_size=BS)
+    with pytest.raises(ValueError, match="num_blocks"):
+        LLMEngine(cfg)
+
+
+@pytest.mark.parametrize("utilization", [0.0, -0.1, 1.5])
+def test_invalid_gpu_memory_utilization(utilization: float) -> None:
+    with pytest.raises(ValueError):
+        EngineConfig(model="unused", num_blocks=8, gpu_memory_utilization=utilization)
+
+
+def test_package_works_without_flash_attn(tiny_model_dir: Path) -> None:
+    """flash_attn is CUDA-only; importing the package and running the reference backend must
+    not need it. A meta-path hook makes any import of flash_attn fail in a fresh interpreter."""
+    import subprocess
+    import sys
+
+    code = f"""
+import sys
+class Block:
+    def find_spec(self, name, path=None, target=None):
+        if name == "flash_attn" or name.startswith("flash_attn."):
+            raise ImportError("flash_attn blocked for this test")
+sys.meta_path.insert(0, Block())
+import stallfree, stallfree.engine, stallfree.attention.flash
+from stallfree.config import EngineConfig, SchedulerConfig
+from stallfree.engine import LLMEngine
+from stallfree.sequence import SamplingParams
+cfg = EngineConfig(
+    model={str(tiny_model_dir)!r}, num_blocks=16, block_size=4, dtype="float32",
+    scheduler=SchedulerConfig(max_model_len=256),
+)
+out = LLMEngine(cfg).generate([[1, 2, 3]], SamplingParams(max_tokens=3, ignore_eos=True))
+assert len(out[0]) == 3
+assert "flash_attn" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)

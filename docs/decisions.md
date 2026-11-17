@@ -21,7 +21,11 @@ Template:
 
 | Date | GPU | Minutes | Cost (USD) | Purpose |
 |---|---|---|---|---|
-| — | — | — | — | No GPU used yet |
+| 2026-11-16 | L4 | < 1 (plus ~12 queued for capacity, not billed) | 0.00 (no billed line) | Driver check (driver 620.70.06) |
+| 2026-11-16 | CPU only | ~3 (image builds + weight download, 8 s for 1.5 GB) | 0.006 | Weights into the volume; image builds have no billed line |
+| 2026-11-16 | A10 (no L4 free) | ~4 (≈ 160 GPU-seconds billed) | 0.063 | Smoke run, flash vs reference, bf16 noise calibration |
+| 2026-11-17 | A10, then A10G, then A10 | ~10 (≈ 545 GPU-seconds billed) | 0.215 | Margin suite (A10), rerun after the preemption fix (landed on A10G), calibration + margin suite in one container (A10) |
+| | | | **0.284** | **Phase 1b total** (budget 4.00); billed figures from `modal billing report -r h`, which lists the A10 class as "A10G" |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
@@ -503,3 +507,119 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   that reserves one slot too few, scheduler entries missing the last token, block counts rounded
   down, per-entry positions starting at 0, and a block leak all fail it. The leak first showed up
   as a hang, which led to the engine's no-progress guard.
+
+## Phase 1b — GPU path
+
+### Driver and development GPU
+- **Driver check (2026-11-16, before any image build):** a Modal L4 reported NVIDIA L4, driver
+  620.70.06, 23,034 MiB. CUDA 13 wheels need driver 580 or newer, so the planned torch 2.10.0
+  (CUDA 13) + flash-attn 2.8.3 stack stays; the CUDA 12.8 fallback was not needed.
+- **Capacity:** the L4 request waited about 12 minutes for capacity. Development functions now
+  request `["L4", "A10"]`: L4 preferred, A10 (Ampere, sm_86, 24 GB, $1.10/h) accepted when no
+  L4 is free. Every result records which GPU ran. Calibration of the bf16 tolerance and the
+  bf16 correctness suite run on one GPU type end to end; if they would land on different types,
+  calibration is repeated on the second. If A10 is used, it is development only: the benchmark
+  target stays L40S (Ada, sm_89).
+
+### FlashAttention backend
+- **Decision:** `attention/flash.py` writes the step's new K/V with the same `index_copy_` as the
+  reference backend, then calls `flash_attn_varlen_func` once per layer with the cache's
+  `[num_blocks, block_size, Hkv, D]` slices, `cu_seqlens_q`, `cu_seqlens_k` (cumulative context
+  lengths, newly added to the metadata), the longest query and context lengths, `causal=True`,
+  and the padded block tables. Every segment (prefill, chunk, decode) is one variable-length
+  sequence in a single call; FlashAttention aligns the causal mask to the end of each context,
+  which is what a segment starting at position `s > 0` needs.
+- **Guards:** the backend refuses a non-CUDA cache and a block size that is not a multiple of 256;
+  the engine refuses the flash backend on a non-CUDA device at construction.
+- **`flash_attn` stays optional:** it is imported when the backend is built, never at module
+  import. A CPU test blocks the module with an import hook and checks that `import stallfree` and
+  a reference-backend engine run end to end without it. mypy ignores the missing module only for
+  `flash_attn`.
+
+### KV cache sizing from GPU memory
+- **Decision:** with `num_blocks=None` (CUDA only), the engine loads the weights, runs one forward
+  of the largest possible step (`max(max_num_batched_tokens, max_model_len)` tokens as one prefill,
+  plus logits for `max_num_seqs` rows) on a throwaway cache, and reads the allocator's peak above
+  the post-load baseline, minus the throwaway cache itself. The cache then gets
+  `gpu_memory_utilization * total - (total - free) - activation_peak`, in whole blocks of
+  `bytes_per_token * block_size` (28 MiB for Qwen3-0.6B in bf16). `total - free` is measured from
+  the device, so it counts weights, the CUDA context, and anything else on the GPU.
+- **Why profile instead of estimating:** activation memory depends on kernels and on the largest
+  step, and the CUDA context is not visible to PyTorch's allocator. Measuring both avoids running
+  out of memory on the first long prompt.
+- **Evidence (CPU):** `tests/unit/test_memory_and_flash_cpu.py` checks the arithmetic (worked
+  24 GiB example, rounding down, failure when no block fits) and the 28 MiB block; the measured
+  values on L4 are recorded below once a GPU session has run.
+- **First GPU runs (A10, driver 610.57.04, torch 2.10.0+cu130, flash-attn 2.8.3):** the smoke run
+  generated correct answers with the flash backend and sized the cache automatically: 22.06 GiB
+  total, 2.00 GiB in use after loading, 0.11 GiB activation peak for a 4,096-token step,
+  649 blocks = 17.75 GiB of KV cache at `gpu_memory_utilization=0.9`.
+- **Flash vs reference (`tests/gpu/test_flash_vs_ref.py`, 14 cases on A10):** criterion fixed
+  before the run: against an fp32 reference on the same paged cache, flash's largest error must be
+  at most twice the reference backend's own error in the same dtype plus one rounding unit at 1.0.
+  Cases: prefill lengths 1/255/256/257/513, chunks crossing 256 and 512 then decodes, and one step
+  mixing a chunk, a decode, and a fresh prefill on interleaved blocks, each in bf16 and fp16. All
+  pass; flash's error never exceeded the reference's (bf16 worst 1.4e-2 vs 2.9e-2, fp16 2.1e-3 vs
+  2.5e-3).
+
+### bf16 margin threshold τ = 0.5
+- **Calibration** (`docs/data/tau_calibration.json`, A10, 32 chat prompts, greedy, up to 64 new
+  tokens, 1,702 generated positions). Reference R: Hugging Face bf16, eager attention, one prompt
+  at a time. Three noise sources, each changing one thing:
+  - B, bf16 eager in batches of 8 (left padding): 15/32 prompts diverge from R; R's top-1 minus
+    top-2 gap at the first differing token: 0.0 ×2, 0.125 ×9, 0.25 ×4 (largest 0.25);
+  - S, bf16 SDPA attention instead of eager: 18/32; 0.0 ×5, 0.0625 ×1, 0.125 ×7, 0.25 ×4, 0.5 ×1
+    (largest 0.5);
+  - F, fp32 eager: 12/32; 0.0 ×3, 0.125 ×5, 0.25 ×3, 0.5 ×1 (largest 0.5).
+  Over all positions R's gap has minimum 0 (exact ties at 24 positions), 5th percentile 0.25,
+  median 2.6; 11.5% of positions are below 0.5.
+- **Observation: the gaps are quantized.** Every divergence gap is 0, 0.0625, 0.125, 0.25, or 0.5:
+  the logits come out of the vocabulary projection in bf16, whose spacing at logit magnitudes of
+  about 16 to 32 is 0.125 to 0.25. A gap is a whole number of those steps, and 0 is an exact tie.
+- **Decision: τ = 0.5** (`tests/gpu/margin.py`, `BF16_MARGIN_TAU`), the largest gap at which HF
+  disagreed with itself across all three sources, about two bf16 steps.
+- **Why not 0.25 (batch shape alone):** this engine differs from HF in more than batch shape. It
+  uses a different attention kernel (FlashAttention; S models a kernel change) and different
+  matrix-multiplication shapes (a flat batch; F shows how far exact arithmetic moves the argmax).
+  Both reach 0.5. Batch shape alone underestimates the noise a correct implementation can show,
+  and a τ of 0.25 would fail correct code on some prompts.
+- **The rule stays strict where the model is confident:** a divergence passes only if the
+  reference itself was within τ at that position; the teacher-forced check (the reference's whole
+  sequence fed through the engine in one prefill) must give the same top-1 token at every position
+  where the reference's gap exceeds τ.
+
+### bf16 correctness on the real model (margin rule, teacher forcing, preemption)
+- **Same GPU for calibration and suite.** Modal's `A10` request lands on either an "NVIDIA A10" or
+  an "NVIDIA A10G" host. A margin run that landed on an A10G
+  (`docs/data/margin_suite_run2_a10g.json`) passed every check but could not be compared with a
+  calibration done on an A10, and showed a gap value (0.375) the A10 calibration never produced.
+  The final numbers therefore come from one function that runs calibration and then the margin
+  suite in the same container (`modal_apps/dev.py::calibrate_and_margin`), so both share one GPU.
+  That run was on an NVIDIA A10 and reproduced the first A10 calibration exactly
+  (`docs/data/tau_calibration_run1_a10.json`), so τ = 0.5 stands.
+- **Results** (`docs/data/margin_suite.json`, NVIDIA A10, Qwen3-0.6B bf16, flash backend, cache
+  sized automatically, 32 chat prompts, greedy, up to 64 tokens):
+
+  | | diverged (of 32) | gaps at divergence | failed the rule |
+  |---|---|---|---|
+  | engine, one prompt at a time | 15 | 0.0 ×3, 0.125 ×8, 0.25 ×3, 0.5 ×1 | 0 |
+  | engine, all 32 batched | 14 | 0.0 ×4, 0.125 ×6, 0.25 ×3, 0.5 ×1 | 0 |
+  | HF bf16 eager, batch 8 (same run) | 15 | largest 0.25 | n/a |
+  | HF bf16 SDPA (same run) | 18 | largest 0.5 | n/a |
+  | HF fp32 (same run) | 12 | largest 0.5 | n/a |
+
+  The engine diverges no more often than HF does against itself with a different kernel, and the
+  divergences do not cluster at τ: the single 0.5 case (prompt 27, position 19) is a position
+  where HF's SDPA and fp32 runs also diverge.
+- **Teacher-forced check:** the reference's 32 sequences (1,702 positions) through the engine's
+  model in one prefill each: at all 1,451 positions where the reference's gap exceeds τ, the top-1
+  token matches, with both the flash and the PyTorch backend. Their logits differ by at most 0.91
+  (bf16 logits of magnitude up to about 30 have a spacing of 0.125 to 0.25).
+- **Forced preemption on GPU:** four requests of 202 to 215 tokens (one 256-token block each)
+  generating 100 tokens (into a second block) on a 6-block cache: one preemption, all four pass
+  the rule (two exact, divergences at gaps 0.125 and 0.0). A first version used prompts of about
+  100 tokens, which never left their first block, so nothing was preempted and the test failed
+  its own assertion; the prompts were lengthened (measured with the tokenizer) before the result
+  above.
+- **KV sizing in that run:** 509 blocks (13.92 GiB), lower than the smoke run's 649 because the
+  Hugging Face reference model was still resident in the same process (5.81 GiB in use).
