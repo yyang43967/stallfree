@@ -684,3 +684,34 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   queue time recorded as time to first token. Tests now check that generation stops within two
   steps of an abort, that impossible requests fail without the loop running, and that with a
   50 ms step TTFT exceeds queue time by at least 40 ms. All nine mutants fail.
+
+### HTTP server
+- **Decision:** FastAPI with `/health` (open), `/v1/models`, and `/v1/chat/completions` (bearer key
+  checked in constant time when configured; 401 otherwise). The handler validates the request,
+  renders and tokenizes the chat, checks admission (`Scheduler.validate()`) and capacity, and only
+  then either collects the whole completion (JSON) or returns an SSE stream. Every error uses
+  OpenAI's `{"error": {message, type, param, code}}` shape: 400 for invalid or unsupported input,
+  404 for another model name, 401, 503 when at capacity, 500 if the engine loop died.
+- **Streaming:** the first event carries the assistant role, then one event per text delta from the
+  incremental detokenizer, then an empty delta with the finish reason, then (if
+  `stream_options.include_usage`) a usage event with empty `choices`, then `data: [DONE]`.
+- **Why the capacity check happens before the stream starts:** once a 200 SSE response has begun,
+  an error can only be sent as an event inside it, which clients handle inconsistently. Checking
+  first gives a plain 503. A mutation test removing that check went unnoticed until a test sent a
+  streaming request to a full server.
+- **Disconnects:** when a streaming client disconnects, Starlette cancels the response generator;
+  the cancellation lands inside the engine's `generate()`, whose `finally` posts the abort. The
+  response generator also closes the engine stream explicitly in its own `finally`. Removing that
+  close did not fail any test, because cancellation and asyncio's finalizer for abandoned async
+  generators reach the same abort; it is kept so the abort does not depend on garbage collection.
+  A non-streaming request whose client disconnects runs to completion (its blocks are freed when
+  it finishes).
+- **Defaults:** temperature 1.0 and top_p 1.0 when omitted (OpenAI's defaults); `max_tokens`
+  defaults to the room left in `max_model_len`.
+- **Evidence:** `tests/integration/test_api.py` runs a real uvicorn server in a thread with the
+  tiny model and a byte-level tokenizer and drives it with the `openai` client: greedy output
+  equals Hugging Face's for the same prompt ids, streamed text equals non-streamed text, usage is
+  exact, 8 concurrent async streams each match their own reference and never mix chunk ids,
+  `chat_template_kwargs` change the prompt, unsupported parameters get a 400 naming them, a
+  disconnect mid-stream frees all blocks and stops generation, a full server answers 503 (JSON and
+  streaming), and `ignore_eos` overrides an end-of-sequence token the model actually produces.

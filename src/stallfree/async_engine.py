@@ -24,7 +24,7 @@ import itertools
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
 
 from stallfree.engine import LLMEngine, StepOutput
@@ -106,7 +106,7 @@ class AsyncEngine:
 
     async def generate(
         self, prompt_token_ids: Sequence[int], params: SamplingParams
-    ) -> AsyncIterator[StepOutput]:
+    ) -> AsyncGenerator[StepOutput, None]:
         """Yield the request's outputs as they are produced; the last one has ``finished``.
 
         Raises:
