@@ -650,3 +650,37 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   in the worker thread. The scheduler's contract tests pass unchanged.
 - **CI:** the Qwen3 tokenizer files (no weights) are cached by the pinned revision for the
   chat-template tests.
+
+### Async engine
+- **Ownership:** one background asyncio task (the loop) owns the synchronous engine; nothing else
+  calls it. Each `engine.step()` runs in a worker thread via `asyncio.to_thread`, so while the GPU
+  works the event loop keeps accepting connections and streaming tokens. The engine is never
+  called from two threads at once: new requests and aborts are appended to an inbox and applied by
+  the loop between steps.
+- **Per-request queues:** each request gets an `asyncio.Queue` of step outputs that its HTTP
+  handler reads. After a step, the loop puts each sequence's token in its queue and, if the request
+  finished, records it as done.
+- **Cancellation:** `generate()` is an async generator; if its consumer stops early (client
+  disconnect, task cancellation, `break`), its `finally` posts an abort, which the loop applies at
+  the next step boundary: the scheduler frees the blocks and the sequence is never scheduled
+  again. A step already running when the consumer stopped still completes, so an aborted request
+  may produce a token or two nobody reads.
+- **Backpressure:** at most `max_queued_requests` requests (waiting or running) at once; beyond
+  that `generate()` raises `QueueFullError` immediately and the API returns 503, instead of
+  queueing without bound. Requests that could never fit are rejected in `generate()` itself
+  (`Scheduler.validate()`), before the loop sees them.
+- **Failure:** if a step raises, the loop records the error, delivers `EngineDeadError` to every
+  waiting request, and refuses new ones, rather than leaving clients hanging.
+- **Metrics** (one JSON log line per request on `stallfree.metrics`): `queue_s` from arrival to the
+  start of the step that produced the first token, `ttft_s` to that token, `tpot_s` as the mean
+  gap between later tokens, `e2e_s`, token counts, and finish reason. With mixed batching off, the
+  first token comes from the request's prefill step, so `queue_s` is the time before its prefill
+  started; once prefills are chunked (Phase 3) it becomes the time before its last chunk started,
+  which will need its own field.
+- **Evidence:** `tests/unit/test_async_engine.py` (each event loop wrapped in a 30 s deadline, so a
+  broken engine fails rather than hangs). A first mutation pass left three bugs undetected: an
+  abort that never reached the engine (the request quietly ran to its limit and then freed its
+  blocks), skipping the up-front validation (the loop's safety net still raised, only later), and
+  queue time recorded as time to first token. Tests now check that generation stops within two
+  steps of an abort, that impossible requests fail without the loop running, and that with a
+  50 ms step TTFT exceeds queue time by at least 40 ms. All nine mutants fail.
