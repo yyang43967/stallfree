@@ -341,3 +341,39 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   GPU tests run on Modal by hand.
 - **Not added yet:** a tokenizer cache. When a test needs the Qwen3 tokenizer, it will be cached by
   its pinned revision.
+
+### Qwen3 forward over a flat token batch
+- **Context:** One step can mix prefills of different lengths and single-token decodes. The model
+  must not care which is which.
+- **Decision:**
+  - The model takes `input_ids [T]` and `positions [T]` for all tokens of the step concatenated,
+    and returns hidden states `[T, hidden]`. Everything except attention is per token, so
+    sequences only matter inside attention.
+  - The attention backend is passed into `forward` explicitly (an `AttentionBackend` callable
+    taking the layer index and that layer's Q, K, V). nano-vllm uses a module-level global context
+    instead; passing it makes the dependency visible and lets tests substitute a simple dense
+    attention.
+  - Logits are computed separately (`compute_logits`) and only for rows that will be sampled,
+    because the vocabulary projection (151,936 columns for Qwen3-0.6B) is wasted on prefill
+    positions whose output is never used.
+  - The arithmetic follows Hugging Face transformers' Qwen3 module operation by operation:
+    RMSNorm statistics in fp32, per-head q/k RMSNorm before RoPE, RoPE angles computed on the fly
+    from `positions * inv_freq`, SwiGLU MLP, tied embeddings. Parameter names match the
+    checkpoint, so weights load by name with no mapping table.
+  - RoPE inverse frequencies are kept as a plain fp32 tensor rather than a module buffer, so
+    casting the model to bf16 does not round them.
+  - The loader fails on any missing, unexpected, or mis-shaped tensor instead of skipping it.
+- **Correctness contract:** against HF (`attn_implementation="eager"`, fp32) on a tiny random
+  Qwen3 (3 layers, hidden 64, 4 query heads, 2 KV heads, head dim 32, so heads × head_dim ≠ hidden
+  as in the real model), the predicted token at every position must be identical and logits must
+  pass `torch.testing.assert_close` at its default fp32 tolerances. Norm weights are randomised
+  in the test model so a norm that fails to load cannot hide behind its default value of 1.
+- **Observed:** a single sequence gives logits bitwise identical to HF on the development machine;
+  flattening several sequences into one batch changes the last bits (max difference 1.5e-6),
+  because matrix multiplications of different shapes accumulate in different orders. The
+  predicted tokens do not change. Bitwise equality is not part of the contract, since it depends
+  on the CPU's math library.
+- **Evidence:** `tests/unit/test_qwen3_model.py`. Seven deliberate bugs (RoPE sign, missing q
+  norm, RoPE skipped on keys, missing residual, RMSNorm epsilon outside the square root, missing
+  final norm, wrong RoPE frequencies) each fail it. The epsilon bug leaves greedy tokens
+  unchanged and is caught only by the logit comparison, which is why both checks are kept.

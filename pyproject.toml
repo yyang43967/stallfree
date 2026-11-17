@@ -50,6 +50,7 @@ files = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 markers = [
     "gpu: needs a CUDA GPU; runs on Modal only",
 ]
