@@ -21,9 +21,11 @@ Template:
 
 | Date | GPU | Minutes | Cost (USD) | Purpose |
 |---|---|---|---|---|
-| 2026-11-16 | L4 | ≤ 1 (plus ~12 queued for capacity, not billed) | ≤ 0.02 | Session 1a: driver check (driver 620.70.06) |
-| 2026-11-16 | A10 (no L4 free) | ≤ 4 (smoke 32 s, GPU tests 19 s, calibration 147 s wall incl. start-up) | ≤ 0.10 incl. CPU/memory (estimate from wall time; billed figure to be checked) | Session 1b: smoke run, flash vs reference, bf16 noise calibration |
-| 2026-11-16 | CPU only | ~3 (image builds + weight download, 8 s for 1.5 GB) | < 0.02 | Weights into the volume |
+| 2026-11-16 | L4 | < 1 (plus ~12 queued for capacity, not billed) | 0.00 (no billed line) | Driver check (driver 620.70.06) |
+| 2026-11-16 | CPU only | ~3 (image builds + weight download, 8 s for 1.5 GB) | 0.006 | Weights into the volume; image builds have no billed line |
+| 2026-11-16 | A10 (no L4 free) | ~4 (≈ 160 GPU-seconds billed) | 0.063 | Smoke run, flash vs reference, bf16 noise calibration |
+| 2026-11-17 | A10, then A10G, then A10 | ~10 (≈ 545 GPU-seconds billed) | 0.215 | Margin suite (A10), rerun after the preemption fix (landed on A10G), calibration + margin suite in one container (A10) |
+| | | | **0.284** | **Phase 1b total** (budget 4.00); billed figures from `modal billing report -r h`, which lists the A10 class as "A10G" |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
