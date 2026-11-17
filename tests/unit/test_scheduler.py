@@ -602,3 +602,43 @@ def test_module_does_not_import_torch() -> None:
 
     code = "import sys, stallfree.scheduler; assert 'torch' not in sys.modules"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_eos_on_last_allowed_token_is_stop() -> None:
+    sim = sim_for(next_token=lambda _tokens: EOS)
+    sim.add(make_seq(0, 3, max_tokens=1, ignore_eos=False))
+    sim.run()
+    seq = sim.finished[0]
+    assert seq.output_token_ids == [EOS]
+    assert seq.finish_reason is FinishReason.STOP, "EOS wins over max_tokens on the same token"
+
+
+def test_update_with_missing_token_changes_nothing() -> None:
+    sched, bm = make()
+    sched.add(make_seq(0, 3))
+    sched.add(make_seq(1, 5))
+    out = sched.schedule()
+    assert [e.seq_id for e in out.entries] == [0, 1]
+    assert all(e.sample for e in out.entries)
+
+    def snapshot() -> list[tuple[object, ...]]:
+        state: list[tuple[object, ...]] = []
+        for sid in (0, 1):
+            seq = sched.get(sid)
+            assert seq is not None
+            state.append(
+                (
+                    seq.num_computed_tokens,
+                    tuple(seq.output_token_ids),
+                    seq.status,
+                    bm.block_table(sid),
+                )
+            )
+        return state
+
+    before = snapshot()
+    free_before = bm.num_free_blocks
+    with pytest.raises(KeyError):
+        sched.update(out, {0: 42})  # token for the first sequence only
+    assert snapshot() == before
+    assert bm.num_free_blocks == free_before
