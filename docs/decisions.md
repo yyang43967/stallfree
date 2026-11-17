@@ -458,3 +458,24 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   tolerance 0.015, about four standard deviations), the top-p kept set at boundary values and in
   shuffled token order, that sampling never leaves the nucleus, reproducibility by seed, and mixed
   greedy and random rows. Nine deliberate bugs each fail at least one test.
+
+### Synchronous engine
+- **Decision:** `LLMEngine` owns the model, KV cache, block manager, scheduler, runner, and
+  sampler, built from one frozen `EngineConfig` validated at construction (block count, block
+  size, dtype, backend; the flash backend requires a block size divisible by 256 and is not
+  available yet). `step()` = schedule, run, sample, update; it returns one `StepOutput` (sequence,
+  token, finished, reason) per sequence that produced a token. `generate()` is an offline
+  convenience that runs prompts to completion. Requests are token ids in and out; tokenizers and
+  chat templates belong to the API layer.
+- **KV cache size is explicit for now** (`num_blocks`). Sizing it from free GPU memory after a
+  profiling forward pass comes with the GPU backend, where it can be measured.
+- **Block size:** the engine default is 256 (FlashAttention-2's requirement). The reference
+  backend accepts any size, and the CPU tests use 4 so short prompts cross many block
+  boundaries; the same code paths run either way.
+- **Counters:** steps and preemptions are counted on the engine so tests (and later metrics) can
+  assert that a scenario really preempted.
+- **Evidence:** `tests/unit/test_engine.py`. A first mutation pass found that swapping which
+  sequence a sampled token or a sampling setting belongs to went unnoticed, because no engine test
+  ran several requests in one step; two tests were added (a batch of greedy requests against HF,
+  and a greedy request decoded in the same steps as a temperature-5 request), after which all six
+  deliberate bugs fail at least one test.

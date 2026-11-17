@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,3 +44,55 @@ class SchedulerConfig:
             raise ValueError(f"max_model_len must be >= 1, got {self.max_model_len}")
         if not 0 <= self.watermark < 1:
             raise ValueError(f"watermark must be in [0, 1), got {self.watermark}")
+
+
+# FlashAttention-2's paged KV path requires the block size to be a multiple of this.
+FLASH_BLOCK_SIZE_MULTIPLE = 256
+DTYPES = ("float32", "bfloat16", "float16")
+
+
+class AttentionBackendName(Enum):
+    TORCH_REF = "torch_ref"  # plain PyTorch, any device; correctness reference
+    FLASH = "flash"  # FlashAttention-2 on GPU (not implemented yet)
+
+
+@dataclass(frozen=True, slots=True)
+class EngineConfig:
+    """Everything needed to build an engine.
+
+    Attributes:
+        model: directory with ``config.json`` and ``*.safetensors``.
+        num_blocks: KV cache blocks to allocate. Set explicitly for now; sizing it from free GPU
+            memory comes with the GPU backend.
+        block_size: tokens per KV block (256 for FlashAttention-2; any size for the reference
+            backend, which tests use with small blocks).
+        dtype: ``"float32"``, ``"bfloat16"``, or ``"float16"`` for weights, activations, and cache.
+        device: ``"cpu"``, ``"cuda"``, ...
+        attention: which attention backend runs the steps.
+        scheduler: scheduler limits and policy.
+        seed: seed for the sampler's random generator.
+    """
+
+    model: str
+    num_blocks: int
+    block_size: int = FLASH_BLOCK_SIZE_MULTIPLE
+    dtype: str = "bfloat16"
+    device: str = "cpu"
+    attention: AttentionBackendName = AttentionBackendName.TORCH_REF
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_blocks < 1:
+            raise ValueError(f"num_blocks must be >= 1, got {self.num_blocks}")
+        if self.block_size < 1:
+            raise ValueError(f"block_size must be >= 1, got {self.block_size}")
+        if (
+            self.attention is AttentionBackendName.FLASH
+            and self.block_size % FLASH_BLOCK_SIZE_MULTIPLE
+        ):
+            raise ValueError(
+                f"the flash backend needs block_size divisible by {FLASH_BLOCK_SIZE_MULTIPLE}"
+            )
+        if self.dtype not in DTYPES:
+            raise ValueError(f"dtype must be one of {DTYPES}, got {self.dtype!r}")
