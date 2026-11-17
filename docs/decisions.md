@@ -484,3 +484,22 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   nothing. With a correct scheduler and block manager this cannot happen (admission control
   guarantees the oldest request fits once nothing else holds blocks); without the guard, a block
   leak made `generate()` loop forever, which a test run only reported as a timeout.
+
+### End-to-end correctness with the real scheduler and block manager
+- **Scenarios** (`tests/integration/test_engine_vs_hf.py`, tiny Qwen3, fp32, PyTorch paged
+  attention, block size 4), each compared token for token with Hugging Face greedy `generate()`:
+  a single request; eight requests of 1 to 20 tokens at once; requests arriving at steps 0, 3, 7,
+  and 12 while others decode; forced preemption (10 blocks, four requests that may each reach
+  17 tokens, with watermark 0 and 0.2; at least one preemption asserted, two observed in each);
+  prompts of 3, 4, 5, 7, 8, 9 tokens (block size minus one, equal, plus one, around one and two
+  blocks), alone and together; a token budget of 8 with at most 2 running, so a 20-token prompt
+  runs alone; and five random workloads with 8 to 14 blocks (11 preemptions observed across them).
+  Every run must end with all blocks free.
+- **Result:** all token-exact; no token flipped, so the strict suite stays in fp32.
+- **Smallest reference gap** (top-1 minus top-2 logit over every compared position, all tests):
+  1.9e-4, in the token-budget scenario; about 18 times the ~1e-5 near-tie threshold.
+- **The end-to-end tests catch component bugs on their own:** replaying earlier mutants against
+  this file only, a preemption that keeps `num_computed_tokens`, an oldest-first victim, a decode
+  that reserves one slot too few, scheduler entries missing the last token, block counts rounded
+  down, per-entry positions starting at 0, and a block leak all fail it. The leak first showed up
+  as a hang, which led to the engine's no-progress guard.
