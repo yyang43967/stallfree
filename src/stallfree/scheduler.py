@@ -25,7 +25,28 @@ Policy with mixed batching off (prefill-priority; the baseline):
    left, the sequence preempts itself and is not scheduled this step.
 
 Prefill and decode never share a step, so while prompts are admitted every running sequence
-stalls. Mixed batching (``enable_mixed_batching``) is the planned fix and is not implemented yet.
+stalls.
+
+Policy with mixed batching on (stall-free, after Sarathi-Serve): every step has a strict token
+budget ``B = max_num_batched_tokens`` and is filled in three passes, in this order:
+
+1. Decodes. Every running sequence with exactly one uncomputed token (a decode, or the last
+   one-token piece of a chunked prefill) gets that token, oldest first, exactly as in a decode
+   step above, including newest-first preemption on a block shortage. Decodes are never delayed
+   by prefills.
+2. Chunk continuations. Every running sequence still in the middle of its prefill (more than one
+   uncomputed token), oldest first, gets ``min(uncomputed, budget left)`` more tokens. If the
+   blocks for that chunk are not free, the newest running sequence not yet in this step is
+   preempted; if there is none, the chunk shrinks to what the free blocks (and the space left in
+   its last block) can hold, and if that is nothing the sequence preempts itself.
+3. Admissions. Waiting sequences in strict FIFO order, while budget is left and fewer than
+   ``max_num_seqs`` are running, each with a first chunk of ``min(uncomputed, budget left)``
+   tokens, shrunk if needed so that at least ``watermark_blocks`` blocks stay free; admission stops
+   at the first sequence for which not even one token fits.
+
+A long prompt is therefore prefilled over several steps, each of which also carries every
+running decode; the budget is never exceeded. An entry samples only when it reaches the end of
+its sequence's tokens, so a non-final chunk produces no token.
 
 Guarantees:
 
