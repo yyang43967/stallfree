@@ -22,6 +22,8 @@ Template:
 | Date | GPU | Minutes | Cost (USD) | Purpose |
 |---|---|---|---|---|
 | 2026-11-16 | L4 | ≤ 1 (plus ~12 queued for capacity, not billed) | ≤ 0.02 | Session 1a: driver check (driver 620.70.06) |
+| 2026-11-16 | A10 (no L4 free) | ≤ 4 (smoke 32 s, GPU tests 19 s, calibration 147 s wall incl. start-up) | ≤ 0.10 incl. CPU/memory (estimate from wall time; billed figure to be checked) | Session 1b: smoke run, flash vs reference, bf16 noise calibration |
+| 2026-11-16 | CPU only | ~3 (image builds + weight download, 8 s for 1.5 GB) | < 0.02 | Weights into the volume |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
@@ -546,3 +548,14 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
 - **Evidence (CPU):** `tests/unit/test_memory_and_flash_cpu.py` checks the arithmetic (worked
   24 GiB example, rounding down, failure when no block fits) and the 28 MiB block; the measured
   values on L4 are recorded below once a GPU session has run.
+- **First GPU runs (A10, driver 610.57.04, torch 2.10.0+cu130, flash-attn 2.8.3):** the smoke run
+  generated correct answers with the flash backend and sized the cache automatically: 22.06 GiB
+  total, 2.00 GiB in use after loading, 0.11 GiB activation peak for a 4,096-token step,
+  649 blocks = 17.75 GiB of KV cache at `gpu_memory_utilization=0.9`.
+- **Flash vs reference (`tests/gpu/test_flash_vs_ref.py`, 14 cases on A10):** criterion fixed
+  before the run: against an fp32 reference on the same paged cache, flash's largest error must be
+  at most twice the reference backend's own error in the same dtype plus one rounding unit at 1.0.
+  Cases: prefill lengths 1/255/256/257/513, chunks crossing 256 and 512 then decodes, and one step
+  mixing a chunk, a decode, and a fresh prefill on interleaved blocks, each in bf16 and fp16. All
+  pass; flash's error never exceeded the reference's (bf16 worst 1.4e-2 vs 2.9e-2, fp16 2.1e-3 vs
+  2.5e-3).
