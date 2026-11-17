@@ -327,3 +327,17 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   tokens depend on the whole history, so any wrong recompute changes the output and fails the
   comparison with a reference produced without a scheduler. 15 random workloads with small block
   pools (including preemptions) must all match the reference.
+
+### Continuous integration
+- **Decision:** One GitHub Actions job on every push and pull request (`.github/workflows/ci.yml`):
+  `uv sync --frozen`, `ruff check`, `ruff format --check`, `mypy src`, `pytest -m "not gpu"` on
+  `ubuntu-24.04` with Python 3.12.
+- **Pins:** uv 0.11.6, the version that wrote `uv.lock`, so the lockfile is read exactly as written.
+  Third-party actions are pinned by commit SHA with the release tag in a comment, so a moved tag
+  cannot change what runs. `--frozen` fails the job if `uv.lock` is out of date instead of
+  silently re-resolving.
+- **Why CPU-only:** the lockfile resolves `torch==2.10.0+cpu` from the PyTorch CPU index on Linux and
+  contains no CUDA packages, so the job installs no GPU libraries and downloads no model weights.
+  GPU tests run on Modal by hand.
+- **Not added yet:** a tokenizer cache. When a test needs the Qwen3 tokenizer, it will be cached by
+  its pinned revision.
