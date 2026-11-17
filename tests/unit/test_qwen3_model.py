@@ -15,6 +15,7 @@ import torch
 from helpers.tiny_qwen3 import (
     TINY_CONFIG,
     DenseCausalAttention,
+    assert_matches_reference,
     hf_greedy,
     hf_logits,
     make_hf_model,
@@ -58,8 +59,7 @@ def our_logits(model: Qwen3ForCausalLM, seqs: list[list[int]]) -> list[torch.Ten
 
 
 def assert_matches(got: torch.Tensor, ref: torch.Tensor) -> None:
-    assert torch.equal(got.argmax(-1), ref.argmax(-1)), "predicted tokens differ"
-    torch.testing.assert_close(got, ref)  # default fp32 tolerances
+    assert_matches_reference(got, ref, "model, dense attention")
 
 
 # --- config ---------------------------------------------------------------------------------

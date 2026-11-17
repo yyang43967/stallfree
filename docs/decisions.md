@@ -377,3 +377,41 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   norm, RoPE skipped on keys, missing residual, RMSNorm epsilon outside the square root, missing
   final norm, wrong RoPE frequencies) each fail it. The epsilon bug leaves greedy tokens
   unchanged and is caught only by the logit comparison, which is why both checks are kept.
+
+### KV cache layout, slot mapping, and the reference paged attention
+- **Layout:** one tensor `[num_layers, 2, num_blocks, block_size, num_kv_heads, head_dim]`
+  (index 0 = K, 1 = V). Per layer, the `[num_blocks, block_size, Hkv, D]` part is exactly the
+  paged layout FlashAttention-2 takes with a `block_table`, so both backends read the same memory.
+  A *slot* is `block_id * block_size + offset`; writes go through a flat
+  `[num_blocks * block_size, Hkv, D]` view with `index_copy_`, one call for K and one for V per
+  layer, no custom kernel.
+- **Per-step metadata, built once and shared by all layers:** `slot_mapping` (where each new
+  token's K/V goes), `cu_seqlens_q` (which query rows belong to which segment), `seq_lens`
+  (context length per segment = start position + new tokens), padded `block_tables`, and the
+  longest query and context lengths. These are the same arguments FlashAttention's varlen call
+  takes, so the GPU backend can reuse them unchanged.
+- **Reference backend (`torch_ref`):** writes the new K/V first, then, per segment, gathers the
+  whole context from the cache through the block table and runs causal attention with the mask
+  aligned to the end of the context (query `j` of a segment that starts at position `s` sees keys
+  `0 .. s + j`). It never reads keys or values from its arguments. A Python loop over segments
+  makes it slow; it exists for exact CPU tests and as a cross-check of the GPU backend.
+- **Evidence:** `tests/unit/test_paged_attention.py`:
+  - attention alone against dense attention on the full sequence: prefills at block boundaries
+    (block size 4 with lengths 3/4/5/7/8/9, block size 256 with 255/256/257), a prefill split into
+    chunks that start mid-block, token-by-token decode, one call mixing a chunk continuation, a
+    decode, and a fresh prefill, and two sequences on interleaved, non-contiguous blocks where
+    every block the checked sequence does not own is overwritten with 1e4 before its last step;
+  - the tiny Qwen3 with paged attention against Hugging Face in fp32: prefill then decode (prompts
+    of 3, 4, 5, 9 tokens on scattered blocks), a 23-token prompt prefilled in three chunks, and
+    two sequences decoded together on interleaved blocks. Generated tokens equal HF `generate()`
+    and every row's logits match HF's within the default fp32 tolerances.
+  - Twelve deliberate bugs (slot offset, slot block index, K/V halves swapped, causal mask not
+    shifted by the start position, mask off by one, context missing the newest token, wrong GQA
+    head mapping, missing 1/sqrt(d), reading new K from the argument, wrong `seq_lens`,
+    non-cumulative `cu_seqlens`, accepting a too-short block table) each fail at least one test.
+    The unshifted mask and the argument-read bug only show up in chunk and decode cases, where a
+    segment starts after position 0.
+- **Near-ties:** the smallest top-1 minus top-2 logit gap of the reference over every compared
+  position is 1.2e-3 (printed by the test run), about a hundred times larger than fp32 rounding
+  noise. If a later scenario flips a token, the gap at that position decides: near 1e-5 means a
+  near-tie on the random model and the strict suite moves to float64; a large gap means a bug.

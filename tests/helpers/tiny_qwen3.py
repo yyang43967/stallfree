@@ -102,3 +102,32 @@ class DenseCausalAttention:
             out.append(torch.matmul(weights, vs).transpose(0, 1))  # [n, H, D]
             start += n
         return torch.cat(out, dim=0)
+
+
+# --- comparison with the reference, and near-tie tracking ---------------------------------
+
+_MIN_GAP: dict[str, float] = {}
+
+
+def record_gap(ref_logits: torch.Tensor, label: str) -> float:
+    """Remember the smallest top-1 minus top-2 gap of the reference over these rows.
+
+    Not an assertion. If a later scenario ever disagrees on a token, compare the gap at that
+    position with this number: a gap near fp32 rounding (~1e-5) means a near-tie on the random
+    model; a large gap means a real bug.
+    """
+    top2 = ref_logits.float().topk(2, dim=-1).values
+    gap = float((top2[..., 0] - top2[..., 1]).min())
+    _MIN_GAP[label] = min(gap, _MIN_GAP.get(label, float("inf")))
+    return gap
+
+
+def min_gaps() -> dict[str, float]:
+    return dict(_MIN_GAP)
+
+
+def assert_matches_reference(got: torch.Tensor, ref: torch.Tensor, label: str) -> None:
+    """Identical predicted tokens and logits within the default fp32 tolerances."""
+    record_gap(ref, label)
+    assert torch.equal(got.argmax(-1), ref.argmax(-1)), "predicted tokens differ"
+    torch.testing.assert_close(got, ref)  # default tolerances, never loosened
