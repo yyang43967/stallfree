@@ -415,3 +415,26 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   position is 1.2e-3 (printed by the test run), about a hundred times larger than fp32 rounding
   noise. If a later scenario flips a token, the gap at that position decides: near 1e-5 means a
   near-tie on the random model and the strict suite moves to float64; a large gap means a bug.
+
+### Model runner
+- **Decision:** The runner takes a `SchedulerOutput` and nothing else. For each entry it appends
+  the entry's tokens to one flat batch, gives each token its position in its own sequence, adds a
+  segment (start position, token count, block table) to the attention metadata, and, if the entry
+  samples, remembers the batch row of the entry's last token. After the forward pass it computes
+  logits for those rows only and returns them with their sequence ids. Sampling is a separate
+  step.
+- **Why it knows so little:** whether an entry is a prefill, a chunk, a decode, or a recompute
+  after preemption is invisible to it; all four are "compute these positions for this sequence".
+  So the scheduling policy can change (mixed batching in Phase 3) without touching the runner.
+- **Non-sampled entries still run:** a non-final prefill chunk produces no logits but its K/V are
+  written, which the next chunk needs.
+- **Attention backend as a factory:** the runner builds a backend per step from the cache and
+  that step's metadata. The PyTorch reference is the default; the FlashAttention backend plugs in
+  the same way.
+- **Tested before the real scheduler existed in the engine:** a scripted scheduler under `tests/`
+  replays hand-written plans (start, count, block table, sample flag) with HF's greedy
+  continuation as the tokens, so each sampled row must predict HF's next token and match HF's
+  logits at that position. Plans cover prefill then decode, a prompt in three chunks where the
+  first two do not sample, one step mixing a chunk continuation, a decode, and a fresh prefill,
+  and a recompute: after some decodes the same sequence is prefilled again from position 0 into
+  different blocks while its old blocks are overwritten with garbage.
