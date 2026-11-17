@@ -157,3 +157,12 @@ def test_each_request_uses_its_own_sampling_params(
     greedy_out, random_out = engine.generate([greedy_prompt, random_prompt], params)
     assert greedy_out == hf_greedy(tiny_hf_model, greedy_prompt, 12)
     assert random_out != hf_greedy(tiny_hf_model, random_prompt, 12)
+
+
+def test_step_fails_loudly_when_nothing_can_run_but_requests_wait(tiny_model_dir: Path) -> None:
+    """If blocks leak, the scheduler can only return empty plans; step() must raise, not spin."""
+    engine = make_engine(tiny_model_dir, num_blocks=4)
+    engine.add_request(prompt(5, 40), SamplingParams(max_tokens=1))
+    engine.block_manager.allocate(seq_id=999, num_tokens=16)  # simulate leaked blocks
+    with pytest.raises(RuntimeError, match="no progress"):
+        engine.step()

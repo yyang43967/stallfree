@@ -479,3 +479,8 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   ran several requests in one step; two tests were added (a batch of greedy requests against HF,
   and a greedy request decoded in the same steps as a temperature-5 request), after which all six
   deliberate bugs fail at least one test.
+- **No-progress guard (added after the end-to-end mutation run):** if the scheduler returns an
+  empty plan while requests are still waiting or running, `step()` raises instead of returning
+  nothing. With a correct scheduler and block manager this cannot happen (admission control
+  guarantees the oldest request fits once nothing else holds blocks); without the guard, a block
+  leak made `generate()` loop forever, which a test run only reported as a timeout.

@@ -94,6 +94,16 @@ class LLMEngine:
         plan = self.scheduler.schedule()
         self.num_preemptions += len(plan.preempted_seq_ids)
         if plan.is_empty:
+            if self.scheduler.has_unfinished():
+                # Cannot happen with a correct scheduler and block manager: admission control
+                # guarantees the oldest request fits once nothing else holds blocks. Failing
+                # loudly beats a caller looping on step() forever.
+                raise RuntimeError(
+                    f"no progress: {self.scheduler.num_waiting} waiting, "
+                    f"{self.scheduler.num_running} running, "
+                    f"{self.block_manager.num_free_blocks}/{self.block_manager.num_blocks} "
+                    "blocks free"
+                )
             return []
         result = self.runner.execute(plan)
         params = {e.seq_id: e.sampling_params for e in plan.entries}
