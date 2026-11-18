@@ -323,6 +323,7 @@ def plot(data: dict[str, Any], out: Path, stem: str) -> list[Path]:
             "axes.grid": True,
             "grid.color": GRID,
             "grid.linewidth": 0.6,
+            "axes.axisbelow": True,
         }
     )
     first = [r for r in data["runs"] if r["repeat"] == 0]
