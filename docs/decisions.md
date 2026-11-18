@@ -29,6 +29,9 @@ Template:
 | 2026-11-17 | A10 | ~1 (≈ 23 GPU-seconds billed) | 0.010 | Phase 2: eight concurrent streaming clients on the real server |
 | 2026-11-17 | A10 | ~2 (≈ 88 GPU-seconds billed, incl. cold start) | 0.035 | Phase 2: `modal serve` endpoint for the GPU Reserve check |
 | | | | **0.045** | **Phase 2 total** (estimate 0.25); running total 0.329 |
+| 2026-11-17 | A10G (A10 requested) | ~6 (366 s function wall time) | 0.139 | Phase 3: calibration + margin suite with mixed batching on, budget 64 |
+| 2026-11-18 | A10 | ~5 (265 s margin + 40 s micro-benchmark) | ~0.12 (estimate; billing hour not complete) | Phase 3: calibration + margin suite with every prompt chunked (budget 16), then the stall micro-benchmark |
+| | | | **~0.26** | **Phase 3 total** (estimate 0.35); running total ~0.59 |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
@@ -821,9 +824,76 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
   and treated as clearly higher. That is the wrong baseline on its own: the right comparison is
   the whole range of HF's self-divergence on the same GPU, and HF against itself at batch 8 also
   diverges on 17 of 32 here.
-- **This run did not chunk single requests:** the 32 prompts are 19 to 27 tokens, below the
+- **This run did not chunk single requests:** the 32 prompts are 17 to 27 tokens, below the
   64-token budget, so one prompt alone is never split. The 17 single-request divergences are the
   same prompts, positions, and gaps as the earlier A10G run with mixed batching off
   (`margin_suite_run2_a10g.json`), which is expected: the two runs execute identical steps.
   Chunking happened only in the batched run. A separate run with a budget small enough to chunk
   every prompt covers the single-request case (next entry).
+- **Every prompt chunked** (`docs/data/margin_suite_mixed16.json`, calibration in
+  `docs/data/tau_calibration_mixed16.json`; `modal_apps/dev.py::phase3_gpu`, budget 16 and
+  `max_num_seqs` 16, NVIDIA A10). The suite counts, per prompt, the steps that computed part of
+  its prompt. Run alone, all 32 prompts were split into 2 chunks; in the batched run all 32 were
+  chunked, into 2 to 11 chunks (2 ×3, 3 ×6, 4 ×8, 5 ×9, 6 ×3, 9, 10, 11 ×1). The calibration in
+  this container reproduced the earlier A10 calibration exactly.
+
+  | | diverged (of 32) | gaps at divergence | failed the rule |
+  |---|---|---|---|
+  | engine, one prompt at a time, 2 chunks each | 17 | 0.0 ×4, 0.125 ×7, 0.25 ×5, 0.5 ×1 | 0 |
+  | engine, all 32 batched, 2-11 chunks | 17 | 0.0 ×5, 0.125 ×8, 0.25 ×3, 0.5 ×1 | 0 |
+  | HF bf16 eager, batch 8 (same run) | 15 | largest 0.25 | n/a |
+  | HF bf16 SDPA (same run) | 18 | largest 0.5 | n/a |
+  | HF fp32 (same run) | 12 | largest 0.5 | n/a |
+  | engine, mixed batching off (earlier A10 run) | 15 single, 14 batched | one 0.5 each | 0 |
+
+  The rates sit inside HF's own same-GPU range (12 to 18). The one divergence at 0.5 is prompt 27
+  at position 19 in both modes, the same position as with mixed batching off, where HF's SDPA and
+  fp32 runs also diverge; nothing else is above 0.25. Chunking changes which near-ties flip
+  (10 of the 17 single-request divergences are at the same position as without chunking), as
+  expected from different kernel shapes and attention split across steps. Teacher-forced: all
+  1,451 positions with a gap above τ agree, flash and the PyTorch backend (largest logit
+  difference 0.91). Forced preemption with 16-token chunks: one preemption, all four requests
+  pass (three exact, one divergence at gap 0.0).
+
+### Stall micro-benchmark
+- **What it measures** (`benchmarks/microbench.py`): the engine driven in-process (no HTTP, no
+  async loop), so only the scheduling policy differs between configurations; the end-to-end
+  comparison over HTTP belongs to the Phase 4 benchmark. Sixteen requests with 128-token prompts
+  decode steadily; then one 3,000-token prompt arrives. Measured: the decodes' inter-token gaps
+  from the one spanning the arrival onward (64 per decode), the long request's TTFT, steps, and
+  output tokens per second over the window (until the long request has 64 tokens and every decode
+  64 more).
+- **Fairness:** one engine (model, KV cache, block manager) serves every run; only the scheduler
+  object is swapped between runs. All configurations run in the same container on the same GPU,
+  one discarded warm-up each, then three repeats interleaved (off, 256, 512, 1024, off, ...).
+  Random prompt ids with a fixed seed, greedy, `ignore_eos`. Raw per-step and per-token
+  timestamps are committed (`benchmarks/data/microbench/stall_a10_d93b769.json`); the table and
+  plots in `benchmarks/results/` are generated from them by `python -m benchmarks.microbench`.
+- **Results** (NVIDIA A10, Qwen3-0.6B bf16, flash backend; median of 3 repeats; every repeat
+  is within 2.3% of its median on every metric):
+
+  | config | max ITL | p99 ITL | median ITL | long TTFT | long prefill steps | steps | output tok/s |
+  |---|---|---|---|---|---|---|---|
+  | off | 143.3 ms | 143.3 ms | 29.5 ms | 112.9 ms | 1 | 65 | 543 |
+  | budget 256 | 30.0 ms | 30.0 ms | 29.7 ms | 366.4 ms | 13 | 76 | 572 |
+  | budget 512 | 30.6 ms | 30.6 ms | 29.7 ms | 201.9 ms | 7 | 70 | 572 |
+  | budget 1024 | 46.8 ms | 46.8 ms | 29.7 ms | 125.1 ms | 3 | 66 | 562 |
+
+- **Reading:** with mixed batching off, the 3,000-token prefill runs alone for 113 ms and every
+  decode waits one extra step (max ITL 143 ms against a normal 29.5 ms). With a 512-token budget
+  the prompt is spread over 7 steps that each also carry all 16 decodes; the largest gap is
+  30.6 ms, 4.7 times lower, and the long request's TTFT rises from 113 ms to 202 ms (1.8 times).
+  A 256 budget buys no further ITL and costs 3.2 times the TTFT; 1024 keeps TTFT within 11% of
+  off but lets gaps reach 47 ms. 512 is the default recommendation for this GPU and model.
+- **Why chunks are almost free here, and what that means:** a step with the 16 decodes takes
+  29.5 ms, and a step with the decodes plus a 496-token chunk takes 28.5 to 29 ms. Steps are
+  dominated by per-step overhead (Python and kernel launches for 28 layers; no CUDA graphs), not
+  by GPU arithmetic, so up to about 500 prompt tokens ride along at no visible cost; 1,000-token
+  chunks cost 36 to 47 ms. The higher output throughput with mixed batching on (572 against
+  543 tokens/s) comes from the same effect: the prefill is absorbed into steps that would cost the
+  same anyway, while off mode spends a whole step on it. An engine with fast decode steps (CUDA
+  graphs, as in vLLM) would see chunks cost relatively more, so the size of these gains is
+  specific to this engine and GPU; this run does not show how stallfree compares with vLLM.
+- **p99 equals max** because each decode has exactly one stalled gap among its 64 (16 of 1,024
+  gaps, above the 1% tail) with mixed batching off, and with it on the elevated gaps are the
+  chunk steps, which are close to every other step.

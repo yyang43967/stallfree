@@ -1,0 +1,423 @@
+{
+  "gpu": "NVIDIA A10",
+  "torch": "2.10.0+cu130",
+  "num_prompts": 32,
+  "max_new_tokens": 64,
+  "reference": "bf16, eager attention, batch 1, greedy",
+  "reference_lengths": [
+    10,
+    57,
+    18,
+    26,
+    12,
+    23,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    64,
+    49,
+    64,
+    64,
+    64,
+    64,
+    24,
+    64,
+    64,
+    20,
+    64,
+    64,
+    64,
+    55,
+    64,
+    64,
+    64,
+    64
+  ],
+  "reference_gap_distribution": {
+    "positions": 1702,
+    "min": 0.0,
+    "p01": 0.0,
+    "p05": 0.25,
+    "median": 2.625,
+    "count_below": {
+      "0.0625": 24,
+      "0.125": 25,
+      "0.25": 77,
+      "0.5": 196,
+      "1.0": 386
+    }
+  },
+  "divergences": {
+    "B_bf16_eager_batch8": [
+      {
+        "prompt": 1,
+        "prompt_len": 23,
+        "position": 45,
+        "ref_token": 1182,
+        "other_token": 304,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 2,
+        "prompt_len": 22,
+        "position": 0,
+        "ref_token": 59790,
+        "other_token": 623,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 6,
+        "prompt_len": 23,
+        "position": 11,
+        "ref_token": 264,
+        "other_token": 1565,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 12,
+        "prompt_len": 27,
+        "position": 59,
+        "ref_token": 28276,
+        "other_token": 9417,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 13,
+        "prompt_len": 22,
+        "position": 19,
+        "ref_token": 279,
+        "other_token": 28030,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 17,
+        "prompt_len": 21,
+        "position": 38,
+        "ref_token": 476,
+        "other_token": 429,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 18,
+        "prompt_len": 26,
+        "position": 16,
+        "ref_token": 2701,
+        "other_token": 14806,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 20,
+        "prompt_len": 23,
+        "position": 10,
+        "ref_token": 323,
+        "other_token": 11,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 21,
+        "prompt_len": 20,
+        "position": 4,
+        "ref_token": 97219,
+        "other_token": 334,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 22,
+        "prompt_len": 25,
+        "position": 54,
+        "ref_token": 3063,
+        "other_token": 2297,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 23,
+        "prompt_len": 23,
+        "position": 2,
+        "ref_token": 6303,
+        "other_token": 9396,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 27,
+        "prompt_len": 24,
+        "position": 21,
+        "ref_token": 13,
+        "other_token": 429,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 28,
+        "prompt_len": 27,
+        "position": 49,
+        "ref_token": 44622,
+        "other_token": 481,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 30,
+        "prompt_len": 23,
+        "position": 42,
+        "ref_token": 304,
+        "other_token": 311,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 31,
+        "prompt_len": 22,
+        "position": 35,
+        "ref_token": 10362,
+        "other_token": 8413,
+        "ref_gap": 0.125
+      }
+    ],
+    "S_bf16_sdpa_batch1": [
+      {
+        "prompt": 1,
+        "prompt_len": 23,
+        "position": 45,
+        "ref_token": 1182,
+        "other_token": 304,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 6,
+        "prompt_len": 23,
+        "position": 11,
+        "ref_token": 264,
+        "other_token": 1565,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 7,
+        "prompt_len": 25,
+        "position": 49,
+        "ref_token": 304,
+        "other_token": 17247,
+        "ref_gap": 0.0625
+      },
+      {
+        "prompt": 8,
+        "prompt_len": 20,
+        "position": 44,
+        "ref_token": 6008,
+        "other_token": 2480,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 11,
+        "prompt_len": 23,
+        "position": 34,
+        "ref_token": 4065,
+        "other_token": 22696,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 12,
+        "prompt_len": 27,
+        "position": 24,
+        "ref_token": 6051,
+        "other_token": 592,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 13,
+        "prompt_len": 22,
+        "position": 19,
+        "ref_token": 279,
+        "other_token": 28030,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 14,
+        "prompt_len": 25,
+        "position": 51,
+        "ref_token": 320,
+        "other_token": 13,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 15,
+        "prompt_len": 25,
+        "position": 17,
+        "ref_token": 785,
+        "other_token": 32,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 16,
+        "prompt_len": 19,
+        "position": 8,
+        "ref_token": 3070,
+        "other_token": 36200,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 17,
+        "prompt_len": 21,
+        "position": 38,
+        "ref_token": 476,
+        "other_token": 429,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 18,
+        "prompt_len": 26,
+        "position": 16,
+        "ref_token": 2701,
+        "other_token": 14806,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 20,
+        "prompt_len": 23,
+        "position": 10,
+        "ref_token": 323,
+        "other_token": 11,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 21,
+        "prompt_len": 20,
+        "position": 4,
+        "ref_token": 97219,
+        "other_token": 334,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 24,
+        "prompt_len": 20,
+        "position": 15,
+        "ref_token": 2867,
+        "other_token": 11,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 27,
+        "prompt_len": 24,
+        "position": 19,
+        "ref_token": 1815,
+        "other_token": 23157,
+        "ref_gap": 0.5
+      },
+      {
+        "prompt": 29,
+        "prompt_len": 22,
+        "position": 62,
+        "ref_token": 11941,
+        "other_token": 1896,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 31,
+        "prompt_len": 22,
+        "position": 35,
+        "ref_token": 10362,
+        "other_token": 8413,
+        "ref_gap": 0.125
+      }
+    ],
+    "F_fp32_eager_batch1": [
+      {
+        "prompt": 1,
+        "prompt_len": 23,
+        "position": 8,
+        "ref_token": 3100,
+        "other_token": 39020,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 6,
+        "prompt_len": 23,
+        "position": 11,
+        "ref_token": 264,
+        "other_token": 1565,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 7,
+        "prompt_len": 25,
+        "position": 36,
+        "ref_token": 2379,
+        "other_token": 10964,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 11,
+        "prompt_len": 23,
+        "position": 34,
+        "ref_token": 4065,
+        "other_token": 22696,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 13,
+        "prompt_len": 22,
+        "position": 19,
+        "ref_token": 279,
+        "other_token": 28030,
+        "ref_gap": 0.25
+      },
+      {
+        "prompt": 14,
+        "prompt_len": 25,
+        "position": 10,
+        "ref_token": 6147,
+        "other_token": 14043,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 15,
+        "prompt_len": 25,
+        "position": 17,
+        "ref_token": 785,
+        "other_token": 32,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 16,
+        "prompt_len": 19,
+        "position": 8,
+        "ref_token": 3070,
+        "other_token": 36200,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 18,
+        "prompt_len": 26,
+        "position": 16,
+        "ref_token": 2701,
+        "other_token": 14806,
+        "ref_gap": 0.125
+      },
+      {
+        "prompt": 23,
+        "prompt_len": 23,
+        "position": 2,
+        "ref_token": 6303,
+        "other_token": 9396,
+        "ref_gap": 0.0
+      },
+      {
+        "prompt": 27,
+        "prompt_len": 24,
+        "position": 19,
+        "ref_token": 1815,
+        "other_token": 23157,
+        "ref_gap": 0.5
+      },
+      {
+        "prompt": 31,
+        "prompt_len": 22,
+        "position": 38,
+        "ref_token": 11,
+        "other_token": 438,
+        "ref_gap": 0.125
+      }
+    ]
+  }
+}
