@@ -150,8 +150,9 @@ def run_calibration() -> dict[str, Any]:
 
 
 @app.function(**GPU_FN, timeout=2400)  # type: ignore[arg-type]
-def run_calibration_and_margin() -> dict[str, Any]:
-    """Calibration and the margin suite in one container, so both run on the same GPU."""
+def run_calibration_and_margin(mixed_budget: int = 0) -> dict[str, Any]:
+    """Calibration and the margin suite in one container, so both run on the same GPU.
+    ``mixed_budget`` > 0 runs the suite with mixed batching on and that token budget."""
     import sys
 
     start = time.time()
@@ -163,6 +164,8 @@ def run_calibration_and_margin() -> dict[str, Any]:
     cal_path.write_text(json.dumps(calibration))
     report = Path("/tmp/margin_report.json")
     env = {**os.environ, "STALLFREE_REPORT": str(report), "STALLFREE_CALIBRATION": str(cal_path)}
+    if mixed_budget:
+        env["STALLFREE_MIXED_BUDGET"] = str(mixed_budget)
     cmd = [
         "python",
         "-m",
@@ -235,12 +238,15 @@ def calibrate() -> None:
 
 
 @app.local_entrypoint()
-def calibrate_and_margin(gpu: str = "A10") -> None:
+def calibrate_and_margin(gpu: str = "A10", mixed_budget: int = 0) -> None:
     fn = run_calibration_and_margin.with_options(gpu=gpu)
-    r = fn.remote()
-    Path("docs/data/tau_calibration.json").write_text(json.dumps(r["calibration"], indent=2) + "\n")
+    r = fn.remote(mixed_budget)
+    suffix = f"_mixed{mixed_budget}" if mixed_budget else ""
+    Path(f"docs/data/tau_calibration{suffix}.json").write_text(
+        json.dumps(r["calibration"], indent=2) + "\n"
+    )
     if r["margin_report"]:
-        Path("docs/data/margin_suite.json").write_text(
+        Path(f"docs/data/margin_suite{suffix}.json").write_text(
             json.dumps(r["margin_report"], indent=2) + "\n"
         )
     print(r["output"])

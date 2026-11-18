@@ -799,3 +799,31 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
 - New end-to-end scenarios: every prompt chunked (budget 4, prompts of 5 to 20 tokens) and
   preemption in the middle of a chunked prefill (asserted to happen with mixed batching on), both
   token-exact. The smallest reference top-1/top-2 gap over the whole run stays at 1.9e-4.
+
+### bf16 correctness on GPU with mixed batching on
+- **Run** (`docs/data/margin_suite_mixed64.json`, calibration in the same container in
+  `docs/data/tau_calibration_mixed64.json`): the margin suite with mixed batching on and a budget
+  of 64 tokens (`modal_apps/dev.py::calibrate_and_margin --mixed-budget 64`). Modal's `A10`
+  request landed on an NVIDIA A10G; τ still holds there (HF's largest self-divergence gap is
+  0.375).
+
+  | | diverged (of 32) | gaps at divergence | failed the rule |
+  |---|---|---|---|
+  | engine, one prompt at a time | 17 | 0.0 ×5, 0.125 ×9, 0.25 ×2, 0.375 ×1 | 0 |
+  | engine, all 32 batched | 13 | 0.0 ×8, 0.125 ×5 | 0 |
+  | HF bf16 eager, batch 8 (same run) | 17 | largest 0.375 | n/a |
+  | HF bf16 SDPA (same run) | 12 | largest 0.375 | n/a |
+  | HF fp32 (same run) | 16 | largest 0.25 | n/a |
+
+  Teacher-forced: all 1,451 positions with a reference gap above τ agree, flash and the PyTorch
+  backend. Forced preemption: one preemption, all four requests pass.
+- **Which baseline:** at first the single-request rate (17) was compared with HF's SDPA rate (12)
+  and treated as clearly higher. That is the wrong baseline on its own: the right comparison is
+  the whole range of HF's self-divergence on the same GPU, and HF against itself at batch 8 also
+  diverges on 17 of 32 here.
+- **This run did not chunk single requests:** the 32 prompts are 19 to 27 tokens, below the
+  64-token budget, so one prompt alone is never split. The 17 single-request divergences are the
+  same prompts, positions, and gaps as the earlier A10G run with mixed batching off
+  (`margin_suite_run2_a10g.json`), which is expected: the two runs execute identical steps.
+  Chunking happened only in the batched run. A separate run with a budget small enough to chunk
+  every prompt covers the single-request case (next entry).

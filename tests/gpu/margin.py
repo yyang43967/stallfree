@@ -98,6 +98,21 @@ def all_row_logits(engine: LLMEngine, tokens: list[int], backend: type) -> torch
     return engine.model.compute_logits(hidden).float()
 
 
+def scheduler_config() -> SchedulerConfig:
+    """Mixed batching is turned on by ``STALLFREE_MIXED_BUDGET=<tokens>``; a small budget makes
+    sure prompts are really chunked (``max_num_seqs`` must not exceed the budget)."""
+    budget = int(os.environ.get("STALLFREE_MIXED_BUDGET", "0"))
+    if budget:
+        return SchedulerConfig(
+            max_model_len=4096,
+            eos_token_id=IM_END,
+            enable_mixed_batching=True,
+            max_num_batched_tokens=budget,
+            max_num_seqs=min(256, budget),
+        )
+    return SchedulerConfig(max_model_len=4096, eos_token_id=IM_END)
+
+
 def make_engine(model_dir: str, num_blocks: int | None = None) -> LLMEngine:
     return LLMEngine(
         EngineConfig(
@@ -106,7 +121,7 @@ def make_engine(model_dir: str, num_blocks: int | None = None) -> LLMEngine:
             dtype="bfloat16",
             device="cuda",
             attention=AttentionBackendName.FLASH,
-            scheduler=SchedulerConfig(max_model_len=4096, eos_token_id=IM_END),
+            scheduler=scheduler_config(),
         )
     )
 
@@ -165,6 +180,7 @@ def run_margin_suite(model_dir: str) -> dict[str, Any]:
         "results": results,
         "summary": {},
         "hf_self_divergence_same_run": hf_self_divergence(),
+        "mixed_batching_budget": int(os.environ.get("STALLFREE_MIXED_BUDGET", "0")) or None,
         "teacher_forced": tf,
     }
     for mode, rows in results.items():
