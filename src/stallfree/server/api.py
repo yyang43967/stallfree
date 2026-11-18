@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from stallfree.async_engine import AsyncEngine, EngineDeadError, QueueFullError
+from stallfree.config import AttentionBackendName, EngineConfig, SchedulerConfig
 from stallfree.sequence import FinishReason, SamplingParams
 from stallfree.server.protocol import (
     AssistantMessage,
@@ -236,13 +237,7 @@ async def _sse(
     yield "data: [DONE]\n\n"
 
 
-def main(argv: list[str] | None = None) -> None:
-    import uvicorn
-
-    from stallfree.config import AttentionBackendName, EngineConfig, SchedulerConfig
-    from stallfree.engine import LLMEngine
-    from stallfree.tokenizer import HFChatTokenizer
-
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Serve a model over an OpenAI-compatible API.")
     p.add_argument("--model", required=True, help="checkpoint directory")
     p.add_argument("--served-model-name", default=None)
@@ -254,6 +249,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--max-num-seqs", type=int, default=256)
     p.add_argument("--max-num-batched-tokens", type=int, default=4096)
+    p.add_argument(
+        "--enable-mixed-batching",
+        action="store_true",
+        help="stall-free mixed batching: prefill chunks and decodes share each step under the "
+        "--max-num-batched-tokens budget",
+    )
     p.add_argument("--max-queued-requests", type=int, default=1024)
     p.add_argument(
         "--api-key-env",
@@ -262,11 +263,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
-    a = p.parse_args(argv)
+    return p.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    tokenizer = HFChatTokenizer(a.model)
-    cfg = EngineConfig(
+
+def engine_config(a: argparse.Namespace, eos_token_id: int | None) -> EngineConfig:
+    return EngineConfig(
         model=a.model,
         num_blocks=a.num_blocks,
         block_size=a.block_size,
@@ -277,9 +278,22 @@ def main(argv: list[str] | None = None) -> None:
             max_num_seqs=a.max_num_seqs,
             max_num_batched_tokens=a.max_num_batched_tokens,
             max_model_len=a.max_model_len,
-            eos_token_id=tokenizer.eos_token_id,
+            enable_mixed_batching=a.enable_mixed_batching,
+            eos_token_id=eos_token_id,
         ),
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    import uvicorn
+
+    from stallfree.engine import LLMEngine
+    from stallfree.tokenizer import HFChatTokenizer
+
+    a = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    tokenizer = HFChatTokenizer(a.model)
+    cfg = engine_config(a, tokenizer.eos_token_id)
     engine = AsyncEngine(LLMEngine(cfg), max_queued_requests=a.max_queued_requests)
     app = create_app(
         engine,
