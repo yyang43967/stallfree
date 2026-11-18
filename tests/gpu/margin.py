@@ -126,6 +126,34 @@ def make_engine(model_dir: str, num_blocks: int | None = None) -> LLMEngine:
     )
 
 
+def generate_counting_chunks(
+    engine: LLMEngine, prompts: list[list[int]], params: SamplingParams
+) -> tuple[list[list[int]], list[int]]:
+    """``engine.generate`` that also counts, per prompt, the steps that computed part of its
+    prompt (1 = the whole prompt in one step; more = chunked prefill)."""
+    ids = [engine.add_request(p, params) for p in prompts]
+    prompt_len = dict(zip(ids, (len(p) for p in prompts), strict=True))
+    chunks = dict.fromkeys(ids, 0)
+    schedule = engine.scheduler.schedule
+
+    def recording_schedule() -> Any:
+        plan = schedule()
+        for e in plan.entries:
+            if e.start_pos < prompt_len[e.seq_id]:
+                chunks[e.seq_id] += 1
+        return plan
+
+    engine.scheduler.schedule = recording_schedule  # type: ignore[method-assign]
+    outputs: dict[int, list[int]] = {i: [] for i in ids}
+    try:
+        while engine.has_unfinished():
+            for out in engine.step():
+                outputs[out.seq_id].append(out.token_id)
+    finally:
+        del engine.scheduler.schedule
+    return [outputs[i] for i in ids], [chunks[i] for i in ids]
+
+
 def run_margin_suite(model_dir: str) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
@@ -137,13 +165,25 @@ def run_margin_suite(model_dir: str) -> dict[str, Any]:
 
     engine = make_engine(model_dir)
     greedy_params = SamplingParams(max_tokens=MAX_NEW)
-    single = [engine.generate([p], greedy_params)[0] for p in prompts]
-    batched = engine.generate(prompts, greedy_params)
+    single, single_chunks = [], []
+    for p in prompts:
+        outs, chunks = generate_counting_chunks(engine, [p], greedy_params)
+        single.append(outs[0])
+        single_chunks.append(chunks[0])
+    batched, batched_chunks = generate_counting_chunks(engine, prompts, greedy_params)
+    prefill_chunks = {"single": single_chunks, "batched": batched_chunks}
     results: dict[str, list[dict[str, Any]]] = {"single": [], "batched": []}
     for mode, outs in (("single", single), ("batched", batched)):
         for i, (r, o) in enumerate(zip(refs, outs, strict=True)):
             results[mode].append(
-                {"prompt": i, "ref_len": len(r), "our_len": len(o), **judge(r, o, gaps[i])}
+                {
+                    "prompt": i,
+                    "prompt_len": len(prompts[i]),
+                    "prefill_chunks": prefill_chunks[mode][i],
+                    "ref_len": len(r),
+                    "our_len": len(o),
+                    **judge(r, o, gaps[i]),
+                }
             )
 
     # Teacher forcing: the reference's sequence through our model, flash and the reference backend.
@@ -189,6 +229,10 @@ def run_margin_suite(model_dir: str) -> dict[str, Any]:
             "diverged": len(div),
             "failed_rule": sum(not x["passes"] for x in rows),
             "gap_histogram": dict(sorted(collections.Counter(str(x["gap"]) for x in div).items())),
+            "prompts_chunked": sum(x["prefill_chunks"] > 1 for x in rows),
+            "prefill_chunks_histogram": dict(
+                sorted(collections.Counter(x["prefill_chunks"] for x in rows).items())
+            ),
         }
     del engine
     torch.cuda.empty_cache()

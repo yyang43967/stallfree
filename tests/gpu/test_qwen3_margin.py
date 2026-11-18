@@ -17,6 +17,12 @@ def test_margin_rule_teacher_forcing_and_preemption(model_dir: str) -> None:
         json.dump(report, f, indent=2)
     for mode in ("single", "batched"):
         assert report["summary"][mode]["failed_rule"] == 0, mode
+    budget = report["mixed_batching_budget"]
+    if budget is not None:
+        # A budget below every prompt length must split every prompt run alone.
+        single = report["results"]["single"]
+        if all(r["prompt_len"] > budget for r in single):
+            assert all(r["prefill_chunks"] > 1 for r in single)
     tf = report["teacher_forced"]
     assert tf["flash_mismatches"] == [], f"top-1 differs where the gap > {BF16_MARGIN_TAU}"
     assert tf["torch_ref_mismatches"] == []
