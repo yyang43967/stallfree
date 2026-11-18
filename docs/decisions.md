@@ -897,3 +897,34 @@ H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
 - **p99 equals max** because each decode has exactly one stalled gap among its 64 (16 of 1,024
   gaps, above the 1% tail) with mixed batching off, and with it on the elevated gaps are the
   chunk steps, which are close to every other step.
+
+### Token budget defaults
+- **Context:** `max_num_batched_tokens` means different things in the two modes. With mixed
+  batching off it caps a prefill step (a prompt longer than it is still admitted alone); with it
+  on it is the hard size of every step, so it trades inter-token latency against TTFT.
+- **Decision:** the default stays 4096 with mixed batching off. With it on, 512 is the
+  recommended budget for Qwen3-0.6B on an A10: in the micro-benchmark it gave the same largest
+  gap as 256 (30.6 against 30.0 ms) at 0.55 of 256's TTFT, while 1024 let gaps reach 47 ms. The
+  server takes it as `--enable-mixed-batching --max-num-batched-tokens 512`. The value has to be
+  measured again on the benchmark GPU (L40S), where steps are cheaper relative to their fixed
+  overhead.
+- **Evidence:** "Stall micro-benchmark" above; `tests/unit/test_server_cli.py` for the flags.
+- **Not done:** the Modal endpoint (`modal_apps/serve.py`) still runs with mixed batching off; it
+  has not been run on GPU with the flag on.
+
+### Known gaps to vLLM before the benchmark
+These are design differences known before any comparison is run; the Phase 4 results will say
+how much each one costs.
+- **No CUDA graphs or `torch.compile`:** every step pays Python and kernel-launch overhead for 28
+  layers. On the A10 a decode step for 16 sequences takes about 29.5 ms, and up to about 500
+  prefill tokens fit into it with no visible cost, which means the GPU is idle for much of the
+  step. vLLM captures decode steps in CUDA graphs.
+- **No custom kernels:** K/V are written with `index_copy_` and RoPE, RMSNorm, and sampling are
+  plain PyTorch ops; vLLM fuses these.
+- **Block size 256** (FlashAttention's paged requirement) against vLLM's 16: more memory is
+  reserved but unused in each sequence's last block.
+- **No prefix caching**, no speculative decoding, no tensor parallelism, no quantization.
+- **API subset:** chat completions only; `n > 1`, `stop`, `seed`, `tools`, logprobs and penalties
+  are rejected with a 400. A non-streaming request is not cancelled when its client disconnects.
+- **Single-threaded engine loop:** scheduling, detokenization, and HTTP handling share one Python
+  process with the model's step running in a worker thread.
