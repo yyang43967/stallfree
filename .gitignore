@@ -20,3 +20,6 @@ __pycache__/
 
 # Benchmarks (raw data in benchmarks/data/ is committed)
 benchmarks/plots/*.tmp
+
+# Model weights downloaded for local runs
+models/

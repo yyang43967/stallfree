@@ -1,0 +1,45 @@
+Third-party notices for stallfree
+=================================
+
+Source code
+-----------
+stallfree contains no source code copied or adapted from other projects. The following projects
+were read as design references only (see docs/decisions.md); no files or code fragments from them
+are included:
+
+- nano-vllm (https://github.com/GeeeekExplorer/nano-vllm), MIT License, read at commit bb823b3.
+- mini-sglang (https://github.com/sgl-project/mini-sglang), MIT License, read at commit 9a91cfa.
+- vLLM (https://github.com/vllm-project/vllm), Apache License 2.0.
+
+If code from another project is adapted in the future, the file will carry a header naming the
+source file and commit, and that project's license notice will be added below.
+
+Dependencies
+------------
+Dependencies are installed by the package manager and are not redistributed in this repository.
+Each keeps its own license. Versions are pinned in uv.lock (and in modal_apps/common.py for the
+GPU image).
+
+Runtime:
+- PyTorch (torch 2.10.0): BSD-3-Clause
+- Hugging Face transformers 5.23.0: Apache-2.0 (also used as the correctness reference in tests)
+- safetensors: Apache-2.0
+- tokenizers: Apache-2.0
+- FastAPI: MIT
+- uvicorn: BSD-3-Clause
+- pydantic: MIT
+- FlashAttention (flash-attn 2.8.3, GPU only): BSD-3-Clause,
+  Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
+
+Development, testing, and cloud runs:
+- Modal client: Apache-2.0
+- openai (Python client, used in tests): Apache-2.0
+- httpx: BSD-3-Clause
+- matplotlib: Matplotlib License (PSF-based)
+- huggingface-hub: Apache-2.0
+- pytest, ruff, mypy: MIT
+
+Model
+-----
+Qwen3-0.6B (https://huggingface.co/Qwen/Qwen3-0.6B), Apache-2.0. The weights are downloaded at
+run time and are not included in this repository.
