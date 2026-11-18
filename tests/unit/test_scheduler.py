@@ -198,10 +198,21 @@ def test_fresh_scheduler_is_empty() -> None:
     assert out.preempted_seq_ids == ()
 
 
-def test_mixed_batching_not_implemented_yet() -> None:
+def test_mixed_batching_constructs_and_schedules() -> None:
     bm = BlockManager(num_blocks=8, block_size=BS)
-    with pytest.raises(NotImplementedError):
-        Scheduler(SchedulerConfig(enable_mixed_batching=True), bm)
+    sched = Scheduler(
+        SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=8,
+            max_model_len=64,
+            watermark=0.0,
+            enable_mixed_batching=True,
+        ),
+        bm,
+    )
+    sched.add(make_seq(0, 3))
+    out = sched.schedule()
+    assert [(e.seq_id, e.start_pos, e.num_new_tokens) for e in out.entries] == [(0, 0, 3)]
 
 
 def test_watermark_blocks_rounds_down() -> None:

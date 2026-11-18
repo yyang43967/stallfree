@@ -49,5 +49,7 @@ gpu_image = (
     .env({"HF_HUB_OFFLINE": "1", "STALLFREE_MODEL_DIR": MODEL_DIR})
     .add_local_file("pyproject.toml", "/root/pyproject.toml")
     .add_local_dir("tests", "/root/tests")
+    .add_local_file("benchmarks/__init__.py", "/root/benchmarks/__init__.py")
+    .add_local_file("benchmarks/microbench.py", "/root/benchmarks/microbench.py")
     .add_local_python_source("stallfree")
 )

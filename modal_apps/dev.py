@@ -4,6 +4,7 @@
     uv run modal run -m modal_apps.dev::smoke           # versions, cache sizing, one generation
     uv run modal run -m modal_apps.dev::gpu_tests       # pytest -m gpu tests/gpu
     uv run modal run -m modal_apps.dev::calibrate       # bf16 noise data -> docs/data/
+    uv run modal run -m modal_apps.dev::phase3_gpu      # chunked margin suite + micro-benchmark
 
 Every GPU function reports which GPU ran and how long the function body took.
 """
@@ -150,8 +151,13 @@ def run_calibration() -> dict[str, Any]:
 
 
 @app.function(**GPU_FN, timeout=2400)  # type: ignore[arg-type]
-def run_calibration_and_margin() -> dict[str, Any]:
-    """Calibration and the margin suite in one container, so both run on the same GPU."""
+def run_calibration_and_margin(mixed_budget: int = 0) -> dict[str, Any]:
+    """Calibration and the margin suite in one container, so both run on the same GPU.
+    ``mixed_budget`` > 0 runs the suite with mixed batching on and that token budget."""
+    return _calibration_and_margin(mixed_budget)
+
+
+def _calibration_and_margin(mixed_budget: int) -> dict[str, Any]:
     import sys
 
     start = time.time()
@@ -163,6 +169,8 @@ def run_calibration_and_margin() -> dict[str, Any]:
     cal_path.write_text(json.dumps(calibration))
     report = Path("/tmp/margin_report.json")
     env = {**os.environ, "STALLFREE_REPORT": str(report), "STALLFREE_CALIBRATION": str(cal_path)}
+    if mixed_budget:
+        env["STALLFREE_MIXED_BUDGET"] = str(mixed_budget)
     cmd = [
         "python",
         "-m",
@@ -186,6 +194,64 @@ def run_calibration_and_margin() -> dict[str, Any]:
         "output": proc.stdout[-8000:],
         "seconds": round(time.time() - start, 1),
     }
+
+
+def _microbench(budgets: list[int | None], repeats: int, commit: str) -> dict[str, Any]:
+    """The stall micro-benchmark in this container (see benchmarks/microbench.py)."""
+    import sys
+    from dataclasses import asdict
+    from importlib.metadata import version
+
+    sys.path.insert(0, "/root")
+    import torch
+
+    from benchmarks.microbench import Scenario, run_suite
+    from stallfree.config import AttentionBackendName, EngineConfig, SchedulerConfig
+    from stallfree.engine import LLMEngine
+
+    start = time.time()
+    engine = LLMEngine(
+        EngineConfig(
+            model=MODEL_DIR,
+            num_blocks=None,
+            dtype="bfloat16",
+            device="cuda",
+            attention=AttentionBackendName.FLASH,
+            scheduler=SchedulerConfig(max_model_len=4096),
+        )
+    )
+    scenario = Scenario()
+    runs = run_suite(engine, budgets, repeats, scenario, torch.cuda.synchronize)
+    return {
+        "meta": {
+            "gpu": _gpu_name(),
+            "model": MODEL_REPO,
+            "model_revision": MODEL_REVISION,
+            "dtype": "bfloat16",
+            "attention": "flash",
+            "block_size": engine.config.block_size,
+            "num_blocks": engine.block_manager.num_blocks,
+            "off_scheduler": asdict(engine.config.scheduler),
+            "torch": torch.__version__,
+            "flash_attn": version("flash-attn"),
+            "commit": commit,
+            "seconds": round(time.time() - start, 1),
+        },
+        "scenario": asdict(scenario),
+        "budgets": budgets,
+        "repeats": repeats,
+        "runs": runs,
+    }
+
+
+@app.function(**GPU_FN, timeout=2400)  # type: ignore[arg-type]
+def run_phase3_gpu(
+    margin_budget: int, budgets: list[int | None], repeats: int, commit: str
+) -> dict[str, Any]:
+    """The chunked margin suite (with calibration) and the stall micro-benchmark, in one container
+    so both report the same GPU."""
+    margin = _calibration_and_margin(margin_budget)
+    return {"margin": margin, "microbench": _microbench(budgets, repeats, commit)}
 
 
 @app.function(**GPU_FN, timeout=1800)  # type: ignore[arg-type]
@@ -235,12 +301,15 @@ def calibrate() -> None:
 
 
 @app.local_entrypoint()
-def calibrate_and_margin(gpu: str = "A10") -> None:
+def calibrate_and_margin(gpu: str = "A10", mixed_budget: int = 0) -> None:
     fn = run_calibration_and_margin.with_options(gpu=gpu)
-    r = fn.remote()
-    Path("docs/data/tau_calibration.json").write_text(json.dumps(r["calibration"], indent=2) + "\n")
+    r = fn.remote(mixed_budget)
+    suffix = f"_mixed{mixed_budget}" if mixed_budget else ""
+    Path(f"docs/data/tau_calibration{suffix}.json").write_text(
+        json.dumps(r["calibration"], indent=2) + "\n"
+    )
     if r["margin_report"]:
-        Path("docs/data/margin_suite.json").write_text(
+        Path(f"docs/data/margin_suite{suffix}.json").write_text(
             json.dumps(r["margin_report"], indent=2) + "\n"
         )
     print(r["output"])
@@ -259,3 +328,36 @@ def concurrency(gpu: str = "") -> None:
     )
     for x in r["results"]:
         print(x)
+
+
+def _git_commit() -> str:
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True
+    )
+    return head.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+
+
+@app.local_entrypoint()
+def phase3_gpu(gpu: str = "A10", margin_budget: int = 16, repeats: int = 3) -> None:
+    """Margin suite with every prompt chunked, then the micro-benchmark (off, on-256/512/1024)."""
+    budgets: list[int | None] = [None, 256, 512, 1024]
+    r = run_phase3_gpu.with_options(gpu=gpu).remote(margin_budget, budgets, repeats, _git_commit())
+    m = r["margin"]
+    suffix = f"_mixed{margin_budget}"
+    Path(f"docs/data/tau_calibration{suffix}.json").write_text(
+        json.dumps(m["calibration"], indent=2) + "\n"
+    )
+    if m["margin_report"]:
+        Path(f"docs/data/margin_suite{suffix}.json").write_text(
+            json.dumps(m["margin_report"], indent=2) + "\n"
+        )
+    print(m["output"])
+    print(f"margin: gpu={m['gpu']} returncode={m['returncode']} seconds={m['seconds']}")
+    mb = r["microbench"]
+    gpu_tag = mb["meta"]["gpu"].replace("NVIDIA ", "").replace(" ", "_").lower()
+    out = Path("benchmarks/data/microbench")
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"stall_{gpu_tag}_{mb['meta']['commit']}.json"
+    path.write_text(json.dumps(mb, indent=1) + "\n")
+    print(f"microbench: gpu={mb['meta']['gpu']} seconds={mb['meta']['seconds']} -> {path}")

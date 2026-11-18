@@ -25,7 +25,30 @@ Policy with mixed batching off (prefill-priority; the baseline):
    left, the sequence preempts itself and is not scheduled this step.
 
 Prefill and decode never share a step, so while prompts are admitted every running sequence
-stalls. Mixed batching (``enable_mixed_batching``) is the planned fix and is not implemented yet.
+stalls.
+
+Policy with mixed batching on (stall-free, after Sarathi-Serve): every step has a strict token
+budget ``B = max_num_batched_tokens`` and is filled in three passes, in this order:
+
+1. Decodes. Every running sequence with exactly one uncomputed token (a decode, or the last
+   one-token piece of a chunked prefill) gets that token, oldest first, exactly as in a decode
+   step above, including newest-first preemption on a block shortage. Decodes are never delayed
+   by prefills.
+2. Chunk continuations. Every running sequence still in the middle of its prefill (more than one
+   uncomputed token), oldest first, gets ``min(uncomputed, budget left)`` more tokens. If the
+   blocks for that chunk are not free, the newest running sequence not yet in this step is
+   preempted; if there is none, the chunk shrinks to what the free blocks (and the space left in
+   its last block) can hold, and if that is nothing the sequence preempts itself.
+3. Admissions. Waiting sequences in strict FIFO order, while budget is left and fewer than
+   ``max_num_seqs`` are running, each with a first chunk of ``min(uncomputed, budget left)``
+   tokens, shrunk if needed so that at least ``watermark_blocks`` blocks stay free; admission stops
+   at the first sequence for which not even one token fits. A step that had to preempt admits
+   nothing (memory is short, and a just-preempted sequence would otherwise be readmitted into the
+   blocks it just gave up).
+
+A long prompt is therefore prefilled over several steps, each of which also carries every
+running decode; the budget is never exceeded. An entry samples only when it reaches the end of
+its sequence's tokens, so a non-final chunk produces no token.
 
 Guarantees:
 
@@ -107,9 +130,6 @@ class Scheduler:
         config: limits and policy.
         block_manager: the KV block pool. The scheduler is its only caller during serving.
 
-    Raises:
-        NotImplementedError: if ``config.enable_mixed_batching`` is true (not implemented yet).
-
     ``watermark_blocks = int(config.watermark * block_manager.num_blocks)``.
 
     State:
@@ -120,8 +140,6 @@ class Scheduler:
     """
 
     def __init__(self, config: SchedulerConfig, block_manager: BlockManager) -> None:
-        if config.enable_mixed_batching:
-            raise NotImplementedError("mixed batching is not implemented yet")
         self._config = config
         self._bm = block_manager
         self._watermark_blocks = int(config.watermark * block_manager.num_blocks)
@@ -235,10 +253,102 @@ class Scheduler:
 
         Returns an empty output when nothing can run (nothing waiting or running).
         """
+        if self._config.enable_mixed_batching:
+            return self._schedule_mixed()
         prefills = self._schedule_prefills()
         if prefills:
             return SchedulerOutput(entries=tuple(prefills))
         return self._schedule_decodes()
+
+    def _schedule_mixed(self) -> SchedulerOutput:
+        """Stall-free step: decodes, then chunk continuations, then admissions."""
+        budget = self._config.max_num_batched_tokens
+        entries: list[ScheduledSeq] = []
+        preempted: list[int] = []
+        scheduled: set[int] = set()
+
+        # 1. Decodes (and one-token final pieces of chunked prefills), oldest first.
+        i = 0
+        while i < len(self._running):
+            seq = self._running[i]
+            if seq.num_uncomputed_tokens != 1:
+                i += 1
+                continue
+            while not self._bm.can_allocate(seq.seq_id, seq.num_tokens):
+                victim = self._pop_newest_unscheduled(after=i, scheduled=scheduled)
+                if victim is None:  # nothing newer to take from: give up its own place
+                    victim = self._running.pop(i)
+                self._preempt(victim)
+                preempted.append(victim.seq_id)
+                if victim is seq:
+                    break
+            else:
+                self._bm.allocate(seq.seq_id, seq.num_tokens)
+                entries.append(self._make_entry(seq, 1))
+                scheduled.add(seq.seq_id)
+                budget -= 1
+                i += 1
+        assert budget >= 0, "max_num_batched_tokens >= max_num_seqs guarantees decodes fit"
+
+        # 2. Continue prefills already in progress, oldest first, within the budget left.
+        j = 0
+        while j < len(self._running) and budget > 0:
+            seq = self._running[j]
+            if seq.seq_id in scheduled or seq.num_uncomputed_tokens <= 1:
+                j += 1
+                continue
+            n = min(seq.num_uncomputed_tokens, budget)
+            target = seq.num_computed_tokens + n
+            while not self._bm.can_allocate(seq.seq_id, target):
+                victim = self._pop_newest_unscheduled(after=j, scheduled=scheduled)
+                if victim is None:
+                    break
+                self._preempt(victim)
+                preempted.append(victim.seq_id)
+            if not self._bm.can_allocate(seq.seq_id, target):
+                # No newer victim: shrink the chunk to the space this sequence can still get.
+                held = len(self._bm.block_table(seq.seq_id))
+                room = (held + self._bm.num_free_blocks) * self._bm.block_size
+                n = min(n, room - seq.num_computed_tokens)
+                if n < 1:
+                    self._preempt(self._running.pop(j))
+                    preempted.append(seq.seq_id)
+                    continue
+                target = seq.num_computed_tokens + n
+            self._bm.allocate(seq.seq_id, target)
+            entries.append(self._make_entry(seq, n))
+            scheduled.add(seq.seq_id)
+            budget -= n
+            j += 1
+
+        # 3. Admit waiting sequences in FIFO order with first chunks, unless this step preempted.
+        while (
+            not preempted
+            and self._waiting
+            and budget > 0
+            and len(self._running) < self._config.max_num_seqs
+        ):
+            seq = self._waiting[0]
+            usable_blocks = self._bm.num_free_blocks - self._watermark_blocks
+            n = min(seq.num_uncomputed_tokens, budget, usable_blocks * self._bm.block_size)
+            if n < 1:
+                break
+            self._bm.allocate(seq.seq_id, n)  # nothing computed yet, so the total is the chunk
+            self._waiting.popleft()
+            seq.status = SequenceStatus.RUNNING
+            self._running.append(seq)
+            entries.append(self._make_entry(seq, n))
+            budget -= n
+
+        return SchedulerOutput(entries=tuple(entries), preempted_seq_ids=tuple(preempted))
+
+    def _pop_newest_unscheduled(self, *, after: int, scheduled: set[int]) -> Sequence | None:
+        """Remove and return the most recently admitted running sequence that comes after index
+        ``after`` and is not yet in this step; None if there is none."""
+        for k in range(len(self._running) - 1, after, -1):
+            if self._running[k].seq_id not in scheduled:
+                return self._running.pop(k)
+        return None
 
     def _schedule_prefills(self) -> list[ScheduledSeq]:
         """Admit waiting sequences in strict FIFO order; empty if the head does not fit."""
