@@ -1,20 +1,29 @@
 """Where the stallfree server's CPU time goes, from a py-spy profile in raw (collapsed) format.
 
-    python -m benchmarks.profile_summary \
-        benchmarks/data/profile/stallfree-on/r0.8x/seed1.pyspy.txt \
+    python -m benchmarks.profile_summary \\
+        benchmarks/data/profile/stallfree-on/r0.8x/seed1.pyspy.txt.gz \\
         --out benchmarks/results/profile.md
 
-py-spy samples every thread that is not idle, ``rate`` times a second, so the number of samples
-divided by ``rate x duration`` is the CPU time in units of one core. Each sample is assigned to
-one component: the innermost stallfree frame decides (for example, a PyTorch op called from
-``stallfree/model/`` counts as model forward); samples with no stallfree frame are assigned by
-library (uvicorn/starlette/h11 to HTTP, asyncio to the event loop). Native frames, when present,
-show how much of each component was spent inside CUDA's kernel-launch call or waiting for the GPU.
+Each sample is one thread at one instant (``rate`` samples a second per thread). Three things are
+decided per sample:
+
+- **State.** In the benchmark sandbox py-spy also reports threads that are blocked, so the
+  innermost native frames decide: ``epoll_wait`` is the event loop waiting for I/O;
+  ``pthread_cond_*wait``, a Python lock acquire, or pybind11's GIL acquire is a thread waiting
+  for the GIL or a lock; anything else is running. Running samples / (rate x duration) is CPU time
+  in units of one core.
+- **Component.** The innermost stallfree frame decides (a PyTorch op called from
+  ``stallfree/model/`` counts as model forward), ignoring the server's entry point; samples with
+  no stallfree frame are assigned by library (uvicorn/starlette/h11 to HTTP, asyncio to the event
+  loop).
+- **Native library** (model forward only): the innermost frame's library, to separate Python and
+  PyTorch dispatch from the CUDA driver call that launches kernels.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import re
 from collections import Counter
@@ -22,23 +31,38 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Innermost stallfree file -> component. Checked in order; the first prefix that matches wins.
-STALLFREE_COMPONENTS: list[tuple[str, str]] = [
-    ("stallfree/model/", "model forward"),
-    ("stallfree/attention/", "model forward"),
-    ("stallfree/kv_cache.py", "model forward"),
-    ("stallfree/model_runner.py", "batch metadata (runner inputs)"),
-    ("stallfree/sampler.py", "sampling"),
-    ("stallfree/scheduler.py", "scheduler and block manager"),
-    ("stallfree/block_manager.py", "scheduler and block manager"),
-    ("stallfree/sequence.py", "scheduler and block manager"),
-    ("stallfree/tokenizer.py", "detokenization"),
-    ("stallfree/server/", "HTTP and SSE"),
-    ("stallfree/async_engine.py", "engine loop (async side)"),
-    ("stallfree/engine.py", "engine step (other)"),
+RUNNING, LOCK_WAIT, IO_WAIT = "running", "waiting for GIL or lock", "waiting for I/O"
+TAIL = 8  # innermost frames inspected for the state
+
+IO_WAIT_RE = re.compile(r"^(epoll_wait|epoll_pwait|poll|select|ppoll)\b")
+LOCK_WAIT_RE = re.compile(
+    r"^(pthread_cond_timedwait|pthread_cond_wait|sem_wait|sem_timedwait|"
+    r"PyThread_acquire_lock_timed|pybind11::gil_scoped_acquire|PyEval_RestoreThread|take_gil)"
+)
+
+# (path fragment, function-name prefix or None, component); first match wins.
+STALLFREE_RULES: list[tuple[str, str | None, str]] = [
+    ("stallfree/kv_cache.py", "slots_for_positions", "batch metadata"),
+    ("stallfree/attention/metadata.py", None, "batch metadata"),
+    ("stallfree/model/", None, "model forward"),
+    ("stallfree/attention/", None, "model forward"),
+    ("stallfree/kv_cache.py", None, "model forward"),
+    ("stallfree/model_runner.py", None, "batch metadata"),
+    ("stallfree/sampler.py", None, "sampling"),
+    ("stallfree/scheduler.py", None, "scheduler and block manager"),
+    ("stallfree/block_manager.py", None, "scheduler and block manager"),
+    ("stallfree/sequence.py", None, "scheduler and block manager"),
+    ("stallfree/tokenizer.py", "HFChatTokenizer.encode_chat", "tokenization (chat template)"),
+    ("stallfree/tokenizer.py", "HFChatTokenizer.render", "tokenization (chat template)"),
+    ("stallfree/tokenizer.py", None, "detokenization"),
+    ("stallfree/server/", None, "HTTP and SSE"),
+    ("stallfree/async_engine.py", None, "engine loop (async side)"),
+    ("stallfree/engine.py", None, "engine step (other)"),
 ]
-# Samples with no stallfree frame: by library.
-LIBRARY_COMPONENTS: list[tuple[str, str]] = [
+# The server's entry point is at the root of every main-thread stack; it says nothing.
+ENTRY_FRAMES = ("main (", "<module> (")
+ENTRY_FILES = ("stallfree/server/api.py", "benchmarks/ptraceable.py")
+LIBRARY_RULES: list[tuple[str, str]] = [
     ("/uvicorn/", "HTTP and SSE"),
     ("/starlette/", "HTTP and SSE"),
     ("/fastapi/", "HTTP and SSE"),
@@ -47,16 +71,19 @@ LIBRARY_COMPONENTS: list[tuple[str, str]] = [
     ("/pydantic", "HTTP and SSE"),
     ("/anyio/", "HTTP and SSE"),
     ("/asyncio/", "event loop"),
+    ("_asyncio.cpython", "event loop"),
     ("/selectors.py", "event loop"),
     ("/concurrent/futures/", "thread handoff"),
     ("/threading.py", "thread handoff"),
+    ("/queue.py", "thread handoff"),
 ]
 COMPONENT_ORDER = [
     "model forward",
-    "batch metadata (runner inputs)",
+    "batch metadata",
     "sampling",
     "scheduler and block manager",
     "engine step (other)",
+    "tokenization (chat template)",
     "detokenization",
     "HTTP and SSE",
     "engine loop (async side)",
@@ -64,12 +91,15 @@ COMPONENT_ORDER = [
     "thread handoff",
     "other",
 ]
-LAUNCH = re.compile(r"cudaLaunchKernel|cuLaunchKernel|cudaLaunchKernelExC|cuLaunchKernelEx")
-GPU_WAIT = re.compile(
-    r"cudaStreamSynchronize|cuStreamSynchronize|cudaDeviceSynchronize|cuCtxSynchronize|"
-    r"cudaMemcpy|cuMemcpy|cudaEventSynchronize|cuEventSynchronize"
-)
-FRAME = re.compile(r"^(?P<func>.*?) \((?P<loc>[^()]*)\)$")
+# Innermost frame of a model-forward sample -> where the time is spent.
+LIBRARY_GROUPS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"libcuda\.so|libcudart\.so"), "CUDA driver/runtime (kernel launch)"),
+    (re.compile(r"libcublas"), "cuBLAS host code"),
+    (re.compile(r"libtorch|libc10|_C\.cpython|flash_attn"), "PyTorch / extension C++ dispatch"),
+    (re.compile(r"libc\.so|libstdc\+\+|ld-linux|libm\.so"), "C library (malloc, memcpy, locks)"),
+    (re.compile(r"\.py:\d+\)$|<frozen"), "Python code (model and torch.nn)"),
+]
+LAUNCH = re.compile(r"cudaLaunchKernel|cuLaunchKernel")
 
 
 @dataclass
@@ -88,9 +118,14 @@ def parse(lines: Iterable[str]) -> list[Sample]:
             continue
         stack, _, count = line.rpartition(" ")
         parts = stack.split(";")
-        thread = parts[0]
-        out.append(Sample(thread, parts[1:], int(count)))
+        out.append(Sample(parts[0], parts[1:], int(count)))
     return out
+
+
+def read_profile(path: Path) -> list[Sample]:
+    raw = path.read_bytes()
+    text = gzip.decompress(raw).decode() if path.suffix == ".gz" else raw.decode()
+    return parse(text.splitlines())
 
 
 def thread_name(label: str) -> str:
@@ -98,23 +133,49 @@ def thread_name(label: str) -> str:
     return label.split(": ", 1)[1] if ": " in label else label
 
 
+def _name(frame: str) -> str:
+    return frame.split(" (", 1)[0]
+
+
+def state(frames: list[str]) -> str:
+    for frame in reversed(frames[-TAIL:]):
+        name = _name(frame)
+        if IO_WAIT_RE.match(name):
+            return IO_WAIT
+        if LOCK_WAIT_RE.match(name):
+            return LOCK_WAIT
+    return RUNNING
+
+
+def _is_entry(frame: str) -> bool:
+    return frame.startswith(ENTRY_FRAMES) and any(f in frame for f in ENTRY_FILES)
+
+
 def component(frames: list[str]) -> str:
     for frame in reversed(frames):  # innermost first
-        m = FRAME.match(frame)
-        loc = m.group("loc") if m else frame
-        for prefix, name in STALLFREE_COMPONENTS:
-            if prefix in loc:
+        if "stallfree/" not in frame or _is_entry(frame):
+            continue
+        for path, func, name in STALLFREE_RULES:
+            if path in frame and (func is None or frame.startswith(func)):
                 return name
     for frame in reversed(frames):
-        for marker, name in LIBRARY_COMPONENTS:
+        for marker, name in LIBRARY_RULES:
             if marker in frame:
                 return name
     return "other"
 
 
+def library_group(frames: list[str]) -> str:
+    leaf = frames[-1] if frames else ""
+    for pattern, name in LIBRARY_GROUPS:
+        if pattern.search(leaf):
+            return name
+    return "Python interpreter (unsymbolized)" if leaf.startswith("0x") else "other"
+
+
 def innermost_stallfree(frames: list[str]) -> str | None:
     for frame in reversed(frames):
-        if "stallfree/" in frame:
+        if "stallfree/" in frame and not _is_entry(frame):
             func, _, loc = frame.partition(" (")
             path = loc.rstrip(")")
             return f"{func} ({path[path.index('stallfree/') :]})"
@@ -125,33 +186,38 @@ def innermost_stallfree(frames: list[str]) -> str | None:
 class Summary:
     total: int = 0
     native: bool = False
-    by_component: Counter[str] = field(default_factory=Counter)
+    by_state: Counter[str] = field(default_factory=Counter)
+    comp_state: Counter[tuple[str, str]] = field(default_factory=Counter)
     launch: Counter[str] = field(default_factory=Counter)
-    gpu_wait: Counter[str] = field(default_factory=Counter)
-    by_thread: Counter[str] = field(default_factory=Counter)
-    thread_component: Counter[tuple[str, str]] = field(default_factory=Counter)
+    thread_state: Counter[tuple[str, str]] = field(default_factory=Counter)
+    thread_comp: Counter[tuple[str, str]] = field(default_factory=Counter)
+    forward_libs: Counter[str] = field(default_factory=Counter)
     functions: Counter[str] = field(default_factory=Counter)
 
 
 def summarize(samples: list[Sample]) -> Summary:
     s = Summary()
     for smp in samples:
+        st = state(smp.frames)
         comp = component(smp.frames)
-        stack = ";".join(smp.frames)
         name = thread_name(smp.thread)
-        s.total += smp.count
-        s.by_component[comp] += smp.count
-        s.by_thread[name] += smp.count
-        s.thread_component[(name, comp)] += smp.count
-        if "(lib" in stack or ".so" in stack:
+        n = smp.count
+        s.total += n
+        s.by_state[st] += n
+        s.comp_state[(comp, st)] += n
+        s.thread_state[(name, st)] += n
+        if any(".so" in f for f in smp.frames):
             s.native = True
-        if LAUNCH.search(stack):
-            s.launch[comp] += smp.count
-        if GPU_WAIT.search(stack):
-            s.gpu_wait[comp] += smp.count
+        if st != RUNNING:
+            continue
+        s.thread_comp[(name, comp)] += n
+        if LAUNCH.search(";".join(smp.frames[-TAIL:])):
+            s.launch[comp] += n
+        if comp == "model forward":
+            s.forward_libs[library_group(smp.frames)] += n
         fn = innermost_stallfree(smp.frames)
         if fn:
-            s.functions[fn] += smp.count
+            s.functions[fn] += n
     return s
 
 
@@ -161,54 +227,76 @@ def _pct(n: int, d: int) -> str:
 
 def report(s: Summary, source: str, rate: int, duration_s: float) -> str:
     ticks = rate * duration_s
+    running = s.by_state[RUNNING]
     lines = [
         "# stallfree server CPU profile",
         "",
         f"Generated by `python -m benchmarks.profile_summary` from `{source}`; "
         "do not edit by hand.",
         "",
-        f"py-spy, {rate} Hz for {duration_s:.0f} s, all non-idle threads"
-        + (", with native frames" if s.native else ", Python frames only")
-        + f". {s.total} samples = {s.total / ticks:.2f} cores busy on average "
-        "(samples / (rate x duration)).",
+        f"py-spy at {rate} Hz for {duration_s:.0f} s on the stallfree server process, every "
+        "thread" + (", with native frames" if s.native else ", Python frames only") + ". "
+        f"{s.total} samples: {running} running ({running / ticks:.2f} cores on average), "
+        f"{s.by_state[LOCK_WAIT]} waiting for the GIL or a lock, "
+        f"{s.by_state[IO_WAIT]} waiting for I/O.",
         "",
-        "## By component",
+        "## CPU time by component (running samples)",
         "",
-        "| component | samples | share of samples | cores | of which in CUDA kernel launch "
-        "| of which waiting for the GPU |",
+        "| component | running samples | share of CPU | cores | of which in CUDA launch call "
+        "| samples waiting for GIL or lock |",
         "|---|---|---|---|---|---|",
     ]
-    for comp in [c for c in COMPONENT_ORDER if s.by_component[c]]:
-        n = s.by_component[comp]
+    for comp in COMPONENT_ORDER:
+        n = s.comp_state[(comp, RUNNING)]
+        waits = s.comp_state[(comp, LOCK_WAIT)]
+        if not n and not waits:
+            continue
+        launch = _pct(s.launch[comp], n) if s.native else "-"
         lines.append(
-            f"| {comp} | {n} | {_pct(n, s.total)} | {n / ticks:.2f} | "
-            f"{_pct(s.launch[comp], n) if s.native else '-'} | "
-            f"{_pct(s.gpu_wait[comp], n) if s.native else '-'} |"
+            f"| {comp} | {n} | {_pct(n, running)} | {n / ticks:.2f} | {launch} | {waits} |"
         )
-    lines += ["", "## By thread", "", "| thread | samples | cores | main components |"]
-    lines.append("|---|---|---|---|")
-    for name, n in s.by_thread.most_common():
-        comps = Counter({c: k for (t, c), k in s.thread_component.items() if t == name})
-        top = ", ".join(f"{c} {_pct(k, n)}" for c, k in comps.most_common(3))
-        lines.append(f"| {name} | {n} | {n / ticks:.2f} | {top} |")
-    lines += ["", "## Innermost stallfree functions (top 20)", ""]
-    lines += ["| function | samples | share |", "|---|---|---|"]
+    lines += [
+        "",
+        "## Model forward: where its CPU time is spent (innermost frame)",
+        "",
+        "| innermost frame | samples | share of model forward |",
+        "|---|---|---|",
+    ]
+    fwd = sum(s.forward_libs.values())
+    for lib, n in s.forward_libs.most_common():
+        lines.append(f"| {lib} | {n} | {_pct(n, fwd)} |")
+    lines += [
+        "",
+        "## By thread",
+        "",
+        "| thread | running | waiting for GIL or lock | waiting for I/O "
+        "| main running components |",
+        "|---|---|---|---|---|",
+    ]
+    running_by_thread = Counter({t: k for (t, st), k in s.thread_state.items() if st == RUNNING})
+    for t in sorted({t for t, _ in s.thread_state}, key=lambda t: -running_by_thread[t]):
+        comps = Counter({c: k for (th, c), k in s.thread_comp.items() if th == t})
+        top = ", ".join(f"{c} {_pct(k, running_by_thread[t])}" for c, k in comps.most_common(3))
+        lines.append(
+            f"| {t} | {s.thread_state[(t, RUNNING)]} | {s.thread_state[(t, LOCK_WAIT)]} | "
+            f"{s.thread_state[(t, IO_WAIT)]} | {top} |"
+        )
+    lines += ["", "## Innermost stallfree functions, running samples (top 20)", ""]
+    lines += ["| function | samples | share of CPU |", "|---|---|---|"]
     for fn, n in s.functions.most_common(20):
-        lines.append(f"| `{fn}` | {n} | {_pct(n, s.total)} |")
+        lines.append(f"| `{fn}` | {n} | {_pct(n, running)} |")
     lines.append("")
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("profile", type=Path, help="py-spy raw output (<stem>.pyspy.txt)")
+    p.add_argument("profile", type=Path, help="py-spy raw output (<stem>.pyspy.txt[.gz])")
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
-    run = json.loads(
-        a.profile.with_name(a.profile.name.replace(".pyspy.txt", ".run.json")).read_text()
-    )
-    spec = run["profile"]
-    s = summarize(parse(a.profile.read_text().splitlines()))
+    stem = a.profile.name.split(".pyspy.txt")[0]
+    spec = json.loads((a.profile.parent / f"{stem}.run.json").read_text())["profile"]
+    s = summarize(read_profile(a.profile))
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(report(s, str(a.profile), int(spec["rate"]), float(spec["duration_s"])))
     print(f"wrote {a.out}")

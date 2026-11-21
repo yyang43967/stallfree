@@ -87,6 +87,17 @@ def _versions() -> dict[str, str]:
     return out
 
 
+def _cpu_model() -> str | None:
+    """The host CPU's model name from /proc/cpuinfo (stallfree's speed depends on it)."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
 def _vllm_flag_check(cmd: list[str]) -> dict[str, bool]:
     """Every ``--flag`` in the server command must appear in ``vllm serve --help=all``, so a
     renamed or removed flag stops the run instead of being silently ignored."""
@@ -111,12 +122,17 @@ def _run_system(
 ) -> dict[str, bytes]:
     """Start ``system``'s server once, run every point against it, return the files written
     (path relative to the data directory -> bytes)."""
+    import shutil
+
     from benchmarks import driver
     from benchmarks.workload import loads, trace_sha256
 
     work = Path("/tmp/bench")
     out_root = work / "out"
-    out_root.mkdir(parents=True, exist_ok=True)
+    # Modal may reuse a container for the next call; start from an empty output directory so
+    # only this call's files are returned.
+    shutil.rmtree(out_root, ignore_errors=True)
+    out_root.mkdir(parents=True)
     trace_paths, trace_hashes = {}, {}
     for seed, blob in traces.items():
         path = work / f"trace_seed{seed}.jsonl.gz"
@@ -142,6 +158,8 @@ def _run_system(
         "memory_mib": MEMORY_MIB,
         "gpu_requested": BENCH_GPU,
         "host_cpu_count": os.cpu_count(),
+        "host_cpu_model": _cpu_model(),
+        "host_kernel": platform.release(),
         "vllm_flag_check": flag_check,
     }
     try:
@@ -377,10 +395,18 @@ def budgets(budgets: str = "256,1024,2048", rate: float = 0.8, repeats: int = 3)
 
 
 @app.local_entrypoint()
-def profile(rate: float = 0.8, seed: int = SEEDS[0], delay_s: float = 40.0) -> None:
+def profile(
+    rate: float = 0.8,
+    seed: int = SEEDS[0],
+    delay_s: float = 40.0,
+    native: bool = True,
+    nonblocking: bool = False,
+    group: str = "profile",
+) -> None:
     """One py-spy profile of the stallfree-on server during a normal run at ``rate``; not part
-    of the results (written to benchmarks/data/profile/)."""
-    extra = {"profile": {"delay_s": delay_s, "duration_s": 60.0, "rate": 100, "native": True}}
-    written = _sweep(["stallfree-on"], [rate], [seed], "profile", extra)
+    of the results (written to benchmarks/data/<group>/)."""
+    spec = {"delay_s": delay_s, "duration_s": 60.0, "rate": 100}
+    spec |= {"native": native, "nonblocking": nonblocking}
+    written = _sweep(["stallfree-on"], [rate], [seed], group, {"profile": spec})
     for key, paths in sorted(written.items()):
         print(key, [p.name for p in paths])

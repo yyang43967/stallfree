@@ -245,6 +245,7 @@ class ProfileSpec:
     duration_s: float = 60.0
     rate: int = 100
     native: bool = True
+    nonblocking: bool = False  # sample without pausing the process (Python frames only)
     result: dict[str, Any] = field(default_factory=dict)
 
 
@@ -252,13 +253,15 @@ def record_profile(pid: int, out: Path, spec: ProfileSpec) -> None:
     """Run py-spy against ``pid``; on failure with native frames, retry once without them.
     The outcome (command, return code, stderr tail) goes into ``spec.result``."""
     time.sleep(spec.delay_s)
-    attempts = [True, False] if spec.native else [False]
+    attempts = [True, False] if spec.native and not spec.nonblocking else [False]
     for native in attempts:
         cmd = ["py-spy", "record", "--pid", str(pid), "--duration", str(int(spec.duration_s))]
         cmd += ["--rate", str(spec.rate), "--format", "raw", "--threads", "--full-filenames"]
         cmd += ["-o", str(out)]
         if native:
             cmd.append("--native")
+        if spec.nonblocking:
+            cmd.append("--nonblocking")
         start = time.time()
         proc = subprocess.run(cmd, capture_output=True, text=True)
         spec.result = {

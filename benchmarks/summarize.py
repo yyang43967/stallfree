@@ -173,6 +173,76 @@ def report(groups: dict[tuple[str, str], list[dict[str, Any]]], title: str, sour
     )
 
 
+BUDGET_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], float | None]]] = [
+    ("TTFT p50 (ms)", lambda m: _ms(m["ttft"]["p50"])),
+    ("TTFT p99 (ms)", lambda m: _ms(m["ttft"]["p99"])),
+    ("TPOT p50 (ms)", lambda m: _ms(m["tpot"]["p50"])),
+    ("ITL p99 (ms)", lambda m: _ms(m["itl"]["p99"])),
+    ("ITL max (ms)", lambda m: _ms(m["itl"]["max"])),
+    ("E2E p50 (s)", lambda m: m["e2e"]["p50"]),
+]
+
+
+def budget_table(data: Path, label: str = "r0.8x") -> str | None:
+    """stallfree-on at one rate with each token budget: the budget runs plus the 512-token
+    runs of the main sweep at the same rate and seeds."""
+    rows: dict[int, list[dict[str, Any]]] = {}
+    budget_root = data / "budget"
+    if not budget_root.exists():
+        return None
+    for (system, lab), runs in collect(budget_root).items():
+        if lab == label:
+            rows[int(system.rsplit("-b", 1)[1])] = runs
+    main = collect(data).get(("stallfree-on", label))
+    if main:
+        rows[512] = main
+    head = ["budget (tokens)", "repeats", *(c for c, _ in BUDGET_COLUMNS)]
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for budget in sorted(rows):
+        runs = rows[budget]
+        cells = [str(budget), str(len(runs))] + [_agg(runs, g) for _, g in BUDGET_COLUMNS]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def saturation_table(data: Path) -> str | None:
+    """Closed-loop saturation throughput of each system that has a saturation file."""
+    import json
+
+    files = sorted((data / "saturation").glob("saturation*.json"))
+    if not files:
+        return None
+    lines = [
+        "| system | concurrency | requests/s | output tokens/s | requests finished in window |",
+        "|---|---|---|---|---|",
+    ]
+    for f in files:
+        d = json.loads(f.read_text())
+        lines.append(
+            f"| {d['system']} | {d['concurrency']} | {d['request_throughput']:.2f} | "
+            f"{d['output_token_throughput_completed']:.0f} | {d['completed_in_window']} |"
+        )
+    return "\n".join(lines)
+
+
+def host_table(groups: dict[tuple[str, str], list[dict[str, Any]]]) -> str:
+    """TPOT p50 and TTFT p50 per NVIDIA driver version (a marker of the host type Modal chose),
+    median over the repeats that ran on that host type, with the count in brackets."""
+    drivers = sorted({str(m["driver"]) for runs in groups.values() for m in runs})
+    head = ["system", "rate"]
+    for d in drivers:
+        head += [f"TPOT p50 (ms), driver {d}", f"TTFT p50 (ms), driver {d}"]
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for key in sorted(groups, key=_order):
+        cells = [key[0], key[1].removeprefix("r")]
+        for d in drivers:
+            runs = [m for m in groups[key] if str(m["driver"]) == d]
+            for get in (lambda m: _ms(m["tpot"]["p50"]), lambda m: _ms(m["ttft"]["p50"])):
+                cells.append(f"{_agg(runs, get)} [{len(runs)}]" if runs else "-")
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("data", type=Path)
@@ -183,11 +253,34 @@ def main(argv: list[str] | None = None) -> None:
     groups = collect(root)
     if not groups:
         raise SystemExit(f"no runs under {root}")
-    name = a.group or "results"
+    name = a.group or "sweep"
     title = "Benchmark dry run" if a.group == "dryrun" else "Benchmark results"
     a.out.mkdir(parents=True, exist_ok=True)
     out = a.out / f"{name}.md"
-    out.write_text(report(groups, title, str(root)))
+    text = report(groups, title, str(root))
+    if not a.group:
+        text += (
+            "\n## By host type\n\nModal placed containers on two host types, told apart by "
+            "their NVIDIA driver version. Repeats are split by host type here; [n] is the number "
+            "of repeats on that host type.\n\n" + host_table(groups) + "\n"
+        )
+        sat = saturation_table(a.data)
+        if sat:
+            text += (
+                "\n## Closed-loop saturation throughput\n\n256 concurrent clients, 30 s warm-up, "
+                "requests finished in the next 120 s. stallfree-off's figure sets the sweep "
+                "rates; the others are reported for reference and are not sweep points.\n\n"
+                + sat
+                + "\n"
+            )
+        budget = budget_table(a.data)
+        if budget:
+            text += (
+                "\n## stallfree-on token budget at 0.8x saturation\n\nThe 512-token row is the "
+                "main sweep's stallfree-on point; the others come from `budget/`. Same rate and "
+                "seeds.\n\n" + budget + "\n"
+            )
+    out.write_text(text)
     print(f"wrote {out}")
 
 

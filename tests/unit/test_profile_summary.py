@@ -8,7 +8,16 @@ import sys
 import pytest
 
 from benchmarks.driver import System, resolve, server_command
-from benchmarks.profile_summary import component, parse, report, summarize
+from benchmarks.profile_summary import (
+    IO_WAIT,
+    LOCK_WAIT,
+    RUNNING,
+    component,
+    parse,
+    report,
+    state,
+    summarize,
+)
 
 ROOT = "/root/stallfree"
 LIB = "/usr/local/lib/python3.12/site-packages"
@@ -16,49 +25,66 @@ LINES = [
     # model forward from the worker thread, inside a CUDA launch
     f"thread (0x1): asyncio_0;run (threading.py:1012);step ({ROOT}/engine.py:80);"
     f"execute ({ROOT}/model_runner.py:120);forward ({ROOT}/model/qwen3.py:200);"
-    f"linear ({LIB}/torch/nn/functional.py:1);cudaLaunchKernel (libcudart.so.13) 30",
-    # building the batch in the runner
-    f"thread (0x1): asyncio_0;step ({ROOT}/engine.py:80);"
-    f"prepare ({ROOT}/model_runner.py:60);tensor ({LIB}/torch/_tensor.py:5) 10",
-    # sampling waits for the GPU
+    f"linear ({LIB}/torch/nn/functional.py:1);cuLaunchKernel (libcuda.so.610) 30",
+    # building the batch: slot mapping is metadata even though it lives in kv_cache.py
+    f"thread (0x1): asyncio_0;step ({ROOT}/engine.py:80);prepare ({ROOT}/model_runner.py:60);"
+    f"slots_for_positions ({ROOT}/kv_cache.py:31);x (/lib/libtorch_cpu.so) 10",
+    # the step thread waiting for the GIL inside sampling
     f"thread (0x1): asyncio_0;step ({ROOT}/engine.py:80);sample ({ROOT}/sampler.py:30);"
-    f"tolist (x);cudaStreamSynchronize (libcudart.so.13) 5",
+    f"0x2ae1 (python3.12);pthread_cond_timedwait (/lib/libc.so.6);0x2ae2 (/lib/libc.so.6) 5",
     # scheduler
     f"thread (0x1): asyncio_0;step ({ROOT}/engine.py:80);schedule ({ROOT}/scheduler.py:200) 4",
-    # detokenization on the event loop thread, called from the SSE generator
-    f"thread (0x2): MainThread;_sse ({ROOT}/server/api.py:210);"
-    f"add ({ROOT}/tokenizer.py:90);decode ({LIB}/transformers/x.py:1) 6",
-    # HTTP with no stallfree frame
-    f"thread (0x2): MainThread;run ({LIB}/uvicorn/server.py:1);send ({LIB}/h11/_connection.py:1) 3",
-    # event loop
-    f"thread (0x2): MainThread;run_forever ({LIB}/asyncio/base_events.py:1) 2",
+    # prompt tokenization on the event loop thread, under the server entry point
+    f"thread (0x2): MainThread;main ({ROOT}/server/api.py:305);"
+    f"chat_completions ({ROOT}/server/api.py:120);"
+    f"HFChatTokenizer.encode_chat ({ROOT}/tokenizer.py:50);encode ({LIB}/transformers/x.py:1) 6",
+    # detokenization from the SSE generator
+    f"thread (0x2): MainThread;main ({ROOT}/server/api.py:305);_sse ({ROOT}/server/api.py:210);"
+    f"IncrementalDetokenizer.add ({ROOT}/tokenizer.py:90) 2",
+    # HTTP with only the entry point as stallfree frame
+    f"thread (0x2): MainThread;main ({ROOT}/server/api.py:305);run ({LIB}/uvicorn/server.py:1);"
+    f"send ({LIB}/h11/_connection.py:1) 3",
+    # event loop idle in epoll
+    f"thread (0x2): MainThread;main ({ROOT}/server/api.py:305);"
+    f"run_forever ({LIB}/asyncio/base_events.py:1);epoll_wait (/lib/libc.so.6) 7",
 ]
 
 
-def test_components_follow_the_innermost_stallfree_frame() -> None:
+def test_components_and_states() -> None:
     samples = parse(LINES)
     assert [component(s.frames) for s in samples] == [
         "model forward",
-        "batch metadata (runner inputs)",
+        "batch metadata",
         "sampling",
         "scheduler and block manager",
+        "tokenization (chat template)",
         "detokenization",
         "HTTP and SSE",
         "event loop",
     ]
-    assert samples[0].count == 30 and samples[0].thread == "thread (0x1): asyncio_0"
+    assert [state(s.frames) for s in samples] == [
+        RUNNING,
+        RUNNING,
+        LOCK_WAIT,
+        RUNNING,
+        RUNNING,
+        RUNNING,
+        RUNNING,
+        IO_WAIT,
+    ]
 
 
-def test_summary_counts_launches_waits_threads_and_cores() -> None:
+def test_summary_counts_running_cpu_launches_and_libraries() -> None:
     s = summarize(parse(LINES))
-    assert s.total == 60 and s.native
+    assert s.total == 67 and s.native
+    assert s.by_state == {RUNNING: 55, LOCK_WAIT: 5, IO_WAIT: 7}
     assert s.launch["model forward"] == 30
-    assert s.gpu_wait["sampling"] == 5
-    assert s.by_thread == {"asyncio_0": 49, "MainThread": 11}
-    text = report(s, "p.txt", rate=10, duration_s=3.0)
-    assert "60 samples = 2.00 cores" in text
-    assert "| model forward | 30 | 50.0% | 1.00 | 100.0% | 0.0% |" in text
-    assert "`forward (stallfree/model/qwen3.py:200)`" in text
+    assert s.forward_libs == {"CUDA driver/runtime (kernel launch)": 30}
+    text = report(s, "p.txt", rate=10, duration_s=5.5)
+    assert "55 running (1.00 cores on average)" in text
+    assert "| model forward | 30 | 54.5% | 0.55 | 100.0% | 0 |" in text
+    assert "| sampling | 0 | 0.0% | 0.00 | - | 5 |" in text
+    assert "`HFChatTokenizer.encode_chat (stallfree/tokenizer.py:50)`" in text
 
 
 def test_budget_variants_and_the_profiling_launcher() -> None:
