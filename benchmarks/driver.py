@@ -5,7 +5,7 @@ utilization of the server's process tree and of the load generator every second 
 (and GPU utilization and SM clock with nvidia-smi when a GPU is present), and writes everything
 for one run next to its per-request records:
 
-    <stem>.jsonl          per-request records from the load generator
+    <stem>.jsonl.gz       per-request records from the load generator (gzipped JSON lines)
     <stem>.summary.json   load generator summary (rate, warm-up and measured counts, ...)
     <stem>.cpu.jsonl      one CPU/GPU sample per second
     <stem>.run.json       system, flags, versions, GPU, CPU request, trace seed and hashes, commit

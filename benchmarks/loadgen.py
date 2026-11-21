@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gzip
 import itertools
 import json
 import time
@@ -197,12 +198,30 @@ async def closed_loop(
     }
 
 
+TIME_DIGITS = 6  # timestamps are stored to the microsecond
+
+
+def _rounded(rec: dict[str, Any]) -> dict[str, Any]:
+    out = dict(rec)
+    for k in ("sent", "end", "scheduled"):
+        if out.get(k) is not None:
+            out[k] = round(out[k], TIME_DIGITS)
+    out["chunks"] = [round(t, TIME_DIGITS) for t in rec["chunks"]]
+    return out
+
+
+def records_path(path: Path) -> Path:
+    """Where the per-request records for run ``<stem>.jsonl`` are stored (gzipped)."""
+    return path.with_name(path.name + ".gz")
+
+
 def write_jsonl(path: Path, result: dict[str, Any]) -> None:
-    """Per-request records as JSON lines; the run summary goes in a ``.summary.json`` file."""
+    """Per-request records as gzipped JSON lines (``<stem>.jsonl.gz``, times rounded to the
+    microsecond); the run summary goes in ``<stem>.summary.json``."""
     records = result.pop("records")
-    with path.open("w") as f:
+    with gzip.open(records_path(path), "wt") as f:
         for r in records:
-            f.write(json.dumps(r) + "\n")
+            f.write(json.dumps(_rounded(r), separators=(",", ":")) + "\n")
     path.with_suffix(".summary.json").write_text(json.dumps(result, indent=1) + "\n")
 
 

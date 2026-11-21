@@ -15,6 +15,7 @@ each text chunk carried; and the load generator's CPU use (flagged above 80% of 
 
 from __future__ import annotations
 
+import gzip
 import json
 import statistics
 from collections.abc import Sequence
@@ -31,10 +32,16 @@ TTFT_GROWTH_SATURATED = 2.0
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
+    """JSON lines from ``path``, or from ``path.gz`` when only the gzipped file exists."""
+    if path.exists():
+        text = path.read_text()
+    else:
+        text = gzip.decompress(path.with_name(path.name + ".gz").read_bytes()).decode()
+    return [json.loads(line) for line in text.splitlines() if line]
 
 
 def load_run(jsonl: Path) -> dict[str, Any]:
+    """All files of the run whose records are ``<stem>.jsonl`` (or ``<stem>.jsonl.gz``)."""
     run_json = jsonl.with_suffix(".run.json")
     cpu = jsonl.with_suffix(".cpu.jsonl")
     return {

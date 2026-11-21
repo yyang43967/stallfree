@@ -162,7 +162,7 @@ def test_run_point_writes_the_run_files_and_the_analysis_passes_its_checks(
         sample_interval=0.1,  # the measured window is under a second on CPU
     )
     assert meta["system"] == "stallfree-off" and meta["gpu_before"] is None
-    for suffix in (".jsonl", ".summary.json", ".cpu.jsonl", ".run.json"):
+    for suffix in (".jsonl.gz", ".summary.json", ".cpu.jsonl", ".run.json"):
         assert out.with_suffix(suffix).exists(), suffix
     m = run_metrics(load_run(out))
     assert m["errors"] == 0 and m["ok"] == m["measured"] >= 12
