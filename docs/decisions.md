@@ -928,3 +928,136 @@ how much each one costs.
   are rejected with a 400. A non-streaming request is not cancelled when its client disconnects.
 - **Single-threaded engine loop:** scheduling, detokenization, and HTTP handling share one Python
   process with the model's step running in a worker thread.
+
+## Phase 4 — Benchmark
+
+### bf16 correctness on the benchmark GPU (L40S)
+- **Context:** τ = 0.5 was calibrated on an A10. The benchmark runs on an NVIDIA L40S (driver
+  610.57.04 for this run), so calibration and the margin suite were repeated there, in one
+  container: smoke run, calibration, margin suite with mixed batching off, then again with mixed
+  batching on and a 16-token budget so every prompt is chunked.
+- **Result:**
+
+  | Run | Engine diverged (single / batched) | Rule failures | Largest gap at a divergence |
+  |---|---|---|---|
+  | Flag off | 16 / 15 of 32 | 0 | 0.375 |
+  | Flag on, budget 16 (all 32 prompts chunked; batched: 2-11 chunks) | 15 / 14 of 32 | 0 | 0.375 |
+  | Hugging Face against itself (B eager batch 8 / S SDPA / F fp32) | 14 / 16 / 13 of 32 | - | 0.25 |
+
+  Teacher-forced: the top-1 token matched at all 1,437 positions whose gap exceeds τ (of 1,689).
+  The preemption scenario passed. The engine's divergence rate is within the range of Hugging
+  Face's own self-divergence on the same GPU, so τ = 0.5 stands on the L40S.
+- **Evidence:** `docs/data/smoke_l40s.json`, `tau_calibration_l40s.json`,
+  `margin_suite_l40s.json`, `margin_suite_l40s_mixed16.json`.
+
+### Prompt text and prompt lengths
+- **Context:** Prompts need realistic tokenization, no shared prefixes, and exact lengths that
+  both servers count the same way.
+- **Decision:** Token ids are sampled at random offsets from *Pride and Prejudice* (public domain,
+  1813; Project Gutenberg #1342 with every Project Gutenberg, edition, and illustration text
+  removed; SHA-256 pinned in `benchmarks/workload.py`, `benchmarks/data/text/README.md`, a test,
+  and every `run.json`). A prompt's length is the length of the **templated** prompt, the number
+  the server reports as `usage.prompt_tokens`: the slice is decoded, re-encoded through the chat
+  template, and lengthened or shortened until the count is exact. Every request is checked against
+  the server's count.
+- **Why templated length:** It is the number the engine actually prefills, and the one both
+  servers report, so the check is end to end. The Qwen3 template adds 8 tokens.
+- **Result:** 0 mismatches in every run so far on both servers, including vLLM, whose image has
+  transformers 5.20.2 against stallfree's 5.23.0.
+
+### Requests: greedy, `ignore_eos`, streamed with usage
+- **Decision:** Every request streams with `temperature: 0`, `ignore_eos: true`, `max_tokens` from
+  the trace, and `stream_options.include_usage`. Greedy decoding removes sampling as a variable;
+  `ignore_eos` makes every system generate exactly the same number of tokens; usage gives the
+  server-side token counts. The analysis checks `completion_tokens == max_tokens` for every
+  request.
+
+### Trace replay, warm-up, and the measured window
+- **Decision:** One trace per seed (seeds 1, 2, 3), generated locally with the pinned tokenizer and
+  sent to every container, so all systems replay byte-identical requests (the trace's SHA-256 is
+  in each `run.json` and checked to match across systems). Gaps are unit-mean exponentials scaled
+  by 1/λ, so every rate replays the same requests in the same order. Requests arriving in the first
+  30 s are warm-up; then the longer of 300 requests and 120 s of arrivals is measured; the run
+  waits for every request to finish. Each (system, seed) gets its own container, which starts the
+  server once and runs the rates from lowest to highest.
+- **Throughput accounting:** request and output-token throughput are measured requests (and their
+  tokens) divided by the window from the first measured send to the last measured completion.
+  That window includes the drain at the end, so below saturation the request throughput reads
+  lower than the offered rate, more so for a system with long end-to-end latency.
+
+### Saturation throughput (closed loop)
+- **Decision:** 256 concurrent clients (= `max_num_seqs`), each sending its next request as soon
+  as its last one finishes, cycling through the seed-1 trace; 30 s warm-up, then requests that
+  finish within 120 s are counted. Requests still running at the end are cancelled.
+- **Result:** stallfree-off saturates at **8.02 req/s** (962 requests, 2,259 output tok/s). The
+  sweep rates are therefore 1.60, 4.01, 6.41, 8.02, and 9.62 req/s.
+- **Observation:** during the closed loop the stallfree server process used 100-113% of one core
+  (mean 102%) while the GPU was busy 48% of the time, at a TPOT of 116 ms: with 256 sequences the
+  engine is limited by Python on the CPU, not by the GPU.
+- **Evidence:** `benchmarks/data/saturation/`.
+
+### Labelling saturated points
+- **Decision:** An open-loop point is labelled saturated when the median TTFT of the last fifth of
+  measured requests (in send order) is more than twice that of the first fifth.
+- **Why:** Below saturation the queue is stationary and the ratio stays near 1; above it the queue
+  grows for the whole run. Comparing achieved throughput with the offered rate does not work here,
+  because the measured window includes the drain (see above).
+
+### vLLM configuration
+- **Context:** The comparison should be against vLLM as it is normally deployed, with only the
+  settings that change what is measured matched.
+- **Decision:** vLLM 0.33.0 runs in its official server image (`vllm/vllm-openai:v0.33.0`; torch
+  2.14.0+cu130). Matched with stallfree: `--max-model-len 4096`, `--max-num-seqs 256`,
+  `--gpu-memory-utilization 0.9`, `--dtype bfloat16`, and `--max-num-batched-tokens 512`, the same
+  token budget as stallfree with mixed batching on (vLLM always chunks prefills). Prefix caching
+  is off (`--disable-prefix-caching`; stallfree has none and the workload shares no prefixes).
+  Everything else is vLLM's default: CUDA graphs, `torch.compile`, its own sampler kernels, and
+  separate API-server and engine-core processes. `vllm-eager` adds only `--enforce-eager`.
+- **Why the official image:** A pip-only install on the slim base image failed at startup: vLLM's
+  default sampler JIT-compiles a FlashInfer kernel with `nvcc`, which that image does not have.
+  Turning the FlashInfer sampler off would have moved vLLM away from its defaults; the official
+  image ships what the defaults need.
+- **Safeguard:** Before starting vLLM, the container checks that every flag in the command appears
+  in `vllm serve --help=all` and stops otherwise. This caught that 0.33.0 spells the prefix-cache
+  switch `--disable-prefix-caching` (not `--no-enable-prefix-caching`).
+
+### stallfree configuration in the benchmark
+- **Decision:** `--max-num-seqs 256 --max-model-len 4096`, automatic KV sizing at 0.9 of GPU
+  memory (1,474 blocks of 256 tokens on the L40S), flash attention, bf16. Mixed batching off uses
+  `--max-num-batched-tokens 4096` (the prefill cap); on uses 512. `--max-queued-requests` is set
+  far above any load so that stallfree never answers 503 (vLLM has no such limit).
+
+### Raw data format
+- **Decision:** Per-request records are gzipped JSON lines with timestamps rounded to the
+  microsecond (`<seed>.jsonl.gz`), next to the CPU samples, the load generator's summary, and a
+  `run.json` with versions, GPU and driver, clocks before and after, CPU and memory requests,
+  flags, trace seed and SHA-256, the source text's SHA-256, and the commit. The server's log is
+  stored per container (gzipped).
+- **Why:** Every chunk's arrival time is kept, so any metric can be recomputed. Uncompressed, one
+  saturation run was 5.8 MB; gzipped with microsecond times about 1.1 KB per request, which puts
+  the full sweep at an estimated 60 MB.
+
+### CPU sampling
+- **Decision:** The driver process (neither server nor load generator) samples, every second, the
+  CPU use of each process in the server's tree and of the load generator with `psutil`, plus GPU
+  utilization and SM clock with `nvidia-smi`. Samples are aligned to each run's measured window by
+  wall-clock time. A run is flagged when the load generator averages over 80% of one core.
+- **Result so far:** the load generator averaged 15-20% (max 31%) in every run, so no run is
+  flagged.
+
+### Driver versions on Modal
+- **Observation:** Modal places containers on different hosts, and the dry run landed on two NVIDIA
+  driver versions (610.57.04 and 620.70.06), both with SM clocks at their 2,520 MHz maximum before
+  and after each run. The driver cannot be pinned on Modal; it is recorded in every `run.json` and
+  in the per-run table.
+
+### Dry run (one rate, one repeat)
+- **Result** (6.41 req/s = 0.8 x saturation, seed 1; `benchmarks/results/dryrun.md`): every
+  system completed all 721 measured requests with no errors, no prompt-token mismatches, and no
+  `ignore_eos` violations. Median TPOT: stallfree-off 87.8 ms, stallfree-on 55.7 ms, vLLM 3.9 ms,
+  vLLM eager 22.8 ms. Median TTFT: 90, 258, 20, and 80 ms. These are single runs; the full sweep
+  repeats each point three times.
+- **Early reading of the gap to vLLM:** vLLM eager is 2.4 times faster per output token than
+  stallfree with mixed batching on, and CUDA graphs make vLLM another 5.8 times faster. stallfree's
+  server process sits at about one full core while the GPU is 40% busy; vLLM's engine core uses
+  111% and keeps the GPU 99% busy. The full sweep will quantify this per rate.
