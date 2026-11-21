@@ -15,9 +15,11 @@ Every token the engine produces is checked against Hugging Face transformers: ex
 CPU, and with a calibrated tolerance in bf16 on GPU. Single GPU, single model; no custom CUDA
 kernels (PyTorch ops and FlashAttention-2 only).
 
-**Status:** the engine, server, and mixed batching are complete and tested. The full latency
-benchmark against vLLM (over HTTP, on an L40S) is in progress; the only performance numbers so far
-are the in-process micro-benchmark below.
+**Status:** the engine, server, and mixed batching are complete and tested. The latency
+benchmark against vLLM over HTTP on an L40S is in [benchmarks/results.md](benchmarks/results.md):
+vLLM is faster on every metric at every rate measured (median time per output token 3.9 ms
+against 54 ms at 0.8 x stallfree's saturation rate), and the results explain where the gap comes
+from. Mixed batching cuts stallfree's p99 inter-token latency from 243 ms to 69 ms there.
 
 ## What problem it solves
 
@@ -116,7 +118,8 @@ rises from 113 ms to 202 ms. What this does and does not show:
   relatively more for each chunk.
 - **The TTFT cost is real.** The long request waits 1.8 times as long for its first token at a
   512 budget, and 3.2 times at 256.
-- **No comparison with vLLM yet.** That is the full benchmark, in progress.
+- **This is not the comparison with vLLM.** That is the serving benchmark in
+  [benchmarks/results.md](benchmarks/results.md).
 
 ## Known simplifications
 
@@ -159,6 +162,9 @@ uv run hf download Qwen/Qwen3-0.6B --local-dir models/qwen3-0.6b
 ```bash
 uv run python -m stallfree.server.api --model models/qwen3-0.6b --served-model-name Qwen/Qwen3-0.6B --device cpu --dtype float32 --block-size 16 --num-blocks 256 --max-model-len 1024 --enable-mixed-batching --max-num-batched-tokens 512
 ```
+
+On a GPU the best budget depends on the GPU: 512 on the A10 above, 1,024 on an L40S in the
+serving benchmark.
 
 ```bash
 curl -N localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 32, "stream": true}'
