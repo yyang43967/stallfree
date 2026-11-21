@@ -22,6 +22,7 @@ from helpers.byte_tokenizer import ByteTokenizer
 from benchmarks.analyze import load_run, run_metrics
 from benchmarks.driver import CpuSampler, System, run_point, server_command
 from benchmarks.loadgen import closed_loop, open_loop
+from benchmarks.summarize import collect, report
 from benchmarks.workload import Mixture, TraceRequest, Window, dumps, make_trace
 from stallfree.async_engine import AsyncEngine
 from stallfree.config import EngineConfig, SchedulerConfig
@@ -158,7 +159,7 @@ def test_run_point_writes_the_run_files_and_the_analysis_passes_its_checks(
         trace_path=trace_path,
         out=out,
         loadgen_args=args,
-        run_meta={"system": "stallfree-off", "seed": 11},
+        run_meta={"system": "stallfree-off", "trace_seed": 11},
         sample_interval=0.1,  # the measured window is under a second on CPU
     )
     assert meta["system"] == "stallfree-off" and meta["gpu_before"] is None
@@ -172,6 +173,9 @@ def test_run_point_writes_the_run_files_and_the_analysis_passes_its_checks(
     assert m["tokens_per_chunk"] >= 1.0
     assert m["ttft"]["p50"] > 0 and m["itl"]["max"] >= m["itl"]["p99"] >= m["itl"]["p50"]
     assert "cpu" in m and m["cpu"]["loadgen_mean"] is not None
+    text = report(collect(tmp_path), "t", str(tmp_path))
+    assert "| stallfree-off | 20.00 (20) | 1 |" in text
+    assert "| stallfree-off | 20 | 11 |" in text  # the per-run checks row
 
 
 def test_server_commands_match_settings_across_systems() -> None:
@@ -188,6 +192,6 @@ def test_server_commands_match_settings_across_systems() -> None:
     assert flag(cmds[System.VLLM], "--max-num-batched-tokens") == "512"
     assert "--enable-mixed-batching" in cmds[System.STALLFREE_ON]
     assert "--enable-mixed-batching" not in cmds[System.STALLFREE_OFF]
-    assert "--no-enable-prefix-caching" in cmds[System.VLLM]
+    assert "--disable-prefix-caching" in cmds[System.VLLM]
     assert "--enforce-eager" in cmds[System.VLLM_EAGER]
     assert "--enforce-eager" not in cmds[System.VLLM]

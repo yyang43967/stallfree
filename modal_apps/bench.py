@@ -32,7 +32,6 @@ from modal_apps.common import (
     MODEL_DIR,
     MODEL_REPO,
     MODEL_REVISION,
-    PYTHON,
     WEIGHTS_DIR,
     git_commit,
     gpu_image,
@@ -51,10 +50,18 @@ SATURATION_TRACE_REQUESTS = 3000  # the closed loop cycles through these
 SEEDS = (1, 2, 3)  # repeat k uses SEEDS[k]; the same seeds for every system
 
 VLLM_VERSION = "0.33.0"
+# vLLM's official server image, so vLLM runs with everything its defaults expect (its FlashInfer
+# sampler JIT-compiles kernels with nvcc, which a slim pip-only image lacks). Python 3.12 inside.
 vllm_image = (
-    modal.Image.debian_slim(python_version=PYTHON)
-    .pip_install(f"vllm=={VLLM_VERSION}", "httpx==0.28.1", "psutil==7.2.2")
+    modal.Image.from_registry(f"vllm/vllm-openai:v{VLLM_VERSION}")
+    .entrypoint([])
+    .run_commands(
+        "ln -sf $(command -v python3) /usr/local/bin/python",
+        "python -m pip install httpx==0.28.1 psutil==7.2.2"
+        " || uv pip install --system httpx==0.28.1 psutil==7.2.2",
+    )
     .env({"HF_HUB_OFFLINE": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1"})
+    .workdir("/root")  # the image's /vllm-workspace has its own `benchmarks` package
     .add_local_python_source("benchmarks")
 )
 
@@ -85,7 +92,12 @@ def _vllm_flag_check(cmd: list[str]) -> dict[str, bool]:
     flags = {a: a in text for a in cmd if a.startswith("--")}
     missing = [f for f, ok in flags.items() if not ok]
     if proc.returncode != 0 or missing:
-        raise RuntimeError(f"vllm serve --help=all: rc={proc.returncode}, missing {missing}")
+        keys = [f.removeprefix("--no-").removeprefix("--") for f in missing]
+        lines = [ln.strip() for ln in text.splitlines() if any(k in ln for k in keys)]
+        raise RuntimeError(
+            f"vllm serve --help=all: rc={proc.returncode}, missing {missing}; "
+            f"related help lines: {lines[:20]}"
+        )
     return flags
 
 
@@ -150,6 +162,14 @@ def _run_system(
                     loadgen_args=args,
                     run_meta=run_meta,
                 )
+    except Exception as exc:
+        log = log_path.read_text(errors="replace") if log_path.exists() else ""
+        errors = [ln for ln in log.splitlines() if "ERROR" in ln or "Error" in ln][-30:]
+        raise RuntimeError(
+            f"{type(exc).__name__}: {exc}\n--- server log error lines ---\n"
+            + "\n".join(errors)
+            + f"\n--- server log tail ---\n{log[-1500:]}"
+        ) from exc
     finally:
         if log_path.exists():
             log_out = out_root / system / f"server{tag}.log.gz"
@@ -284,10 +304,14 @@ def _sweep(
 
 
 @app.local_entrypoint()
-def dryrun(rate: float = 0.8, seed: int = SEEDS[0]) -> None:
-    """All four systems at one rate (a multiple of the saturation rate), one repeat."""
-    systems = ["stallfree-off", "stallfree-on", "vllm", "vllm-eager"]
-    written = _sweep(systems, [rate], [seed], "dryrun")
+def dryrun(
+    rate: float = 0.8,
+    seed: int = SEEDS[0],
+    systems: str = "stallfree-off,stallfree-on,vllm,vllm-eager",
+) -> None:
+    """All four systems (or a comma-separated subset) at one rate, a multiple of the saturation
+    rate, one repeat."""
+    written = _sweep(systems.split(","), [rate], [seed], "dryrun")
     for key, paths in sorted(written.items()):
         print(key, len(paths), "files")
 

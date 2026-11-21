@@ -70,7 +70,7 @@ def server_command(system: System, model_dir: str, port: int = PORT) -> list[str
             return [*cmd, "--enable-mixed-batching", "--max-num-batched-tokens", str(MIXED_BUDGET)]
         return [*cmd, "--max-num-batched-tokens", str(OFF_PREFILL_CAP)]
     cmd = ["vllm", "serve", model_dir, *common, "--dtype", "bfloat16"]
-    cmd += ["--max-num-batched-tokens", str(MIXED_BUDGET), "--no-enable-prefix-caching"]
+    cmd += ["--max-num-batched-tokens", str(MIXED_BUDGET), "--disable-prefix-caching"]
     cmd += ["--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION)]
     if system is System.VLLM_EAGER:
         cmd.append("--enforce-eager")
