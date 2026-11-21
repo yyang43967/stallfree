@@ -22,3 +22,12 @@ def test_quoted_table_rows_match_the_generated_tables() -> None:
     assert len(quoted) >= 14
     for line in quoted:
         assert line in generated, line
+
+
+def test_readme_benchmark_rows_match_the_generated_table() -> None:
+    readme = (ROOT / "README.md").read_text().splitlines()
+    generated = (ROOT / "benchmarks" / "results" / "sweep.md").read_text().splitlines()
+    rows = [line for line in readme if " | 6.41 (0.8x) | " in line]
+    assert len(rows) == 4
+    for line in rows:
+        assert line in generated, line
