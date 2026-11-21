@@ -27,6 +27,7 @@ from modal_apps.common import (
     MODEL_REVISION,
     WEIGHTS_DIR,
     download_image,
+    git_commit,
     gpu_image,
     weights_volume,
 )
@@ -167,32 +168,31 @@ def _calibration_and_margin(mixed_budget: int) -> dict[str, Any]:
     calibration = calibrate_fn(MODEL_DIR)
     cal_path = Path("/tmp/tau_calibration.json")
     cal_path.write_text(json.dumps(calibration))
-    report = Path("/tmp/margin_report.json")
-    env = {**os.environ, "STALLFREE_REPORT": str(report), "STALLFREE_CALIBRATION": str(cal_path)}
-    if mixed_budget:
-        env["STALLFREE_MIXED_BUDGET"] = str(mixed_budget)
-    cmd = [
-        "python",
-        "-m",
-        "pytest",
-        "-q",
-        "-s",
-        "-m",
-        "gpu",
-        "-p",
-        "no:cacheprovider",
-        "tests/gpu",
-        "-k",
-        "margin",
-    ]
-    proc = subprocess.run(cmd, cwd="/root", capture_output=True, text=True, env=env)
+    result = _margin_suite(cal_path, mixed_budget)
     return {
         "gpu": _gpu_name(),
         "calibration": calibration,
+        **result,
+        "seconds": round(time.time() - start, 1),
+    }
+
+
+def _margin_suite(cal_path: Path, mixed_budget: int) -> dict[str, Any]:
+    """The margin tests (pytest -k margin) against the calibration in ``cal_path``."""
+    report = Path("/tmp/margin_report.json")
+    report.unlink(missing_ok=True)
+    env = {**os.environ, "STALLFREE_REPORT": str(report), "STALLFREE_CALIBRATION": str(cal_path)}
+    if mixed_budget:
+        env["STALLFREE_MIXED_BUDGET"] = str(mixed_budget)
+    cmd = ["python", "-m", "pytest", "-q", "-s", "-m", "gpu", "-p", "no:cacheprovider"]
+    cmd += ["tests/gpu", "-k", "margin"]
+    start = time.time()
+    proc = subprocess.run(cmd, cwd="/root", capture_output=True, text=True, env=env)
+    return {
         "margin_report": json.loads(report.read_text()) if report.exists() else None,
         "returncode": proc.returncode,
         "output": proc.stdout[-8000:],
-        "seconds": round(time.time() - start, 1),
+        "margin_seconds": round(time.time() - start, 1),
     }
 
 
@@ -252,6 +252,31 @@ def run_phase3_gpu(
     so both report the same GPU."""
     margin = _calibration_and_margin(margin_budget)
     return {"margin": margin, "microbench": _microbench(budgets, repeats, commit)}
+
+
+@app.function(**{**GPU_FN, "gpu": "L40S"}, timeout=3600)  # type: ignore[arg-type]
+def run_benchmark_gpu_checks(mixed_budget: int) -> dict[str, Any]:
+    """On the benchmark GPU, in one container: the smoke run, calibration with the margin suite
+    (mixed batching off), then the margin suite again with mixed batching on and every prompt
+    chunked, checked against the same calibration."""
+    import gc
+
+    import torch
+
+    start = time.time()
+    smoke = smoke_run.local()
+    gc.collect()
+    torch.cuda.empty_cache()  # release the smoke engine's KV cache before the next steps
+    off = _calibration_and_margin(0)
+    cal_path = Path("/tmp/tau_calibration.json")  # written by the call above
+    on = _margin_suite(cal_path, mixed_budget)
+    return {
+        "gpu": _gpu_name(),
+        "smoke": smoke,
+        "off": off,
+        "on": on,
+        "seconds": round(time.time() - start, 1),
+    }
 
 
 @app.function(**GPU_FN, timeout=1800)  # type: ignore[arg-type]
@@ -330,19 +355,11 @@ def concurrency(gpu: str = "") -> None:
         print(x)
 
 
-def _git_commit() -> str:
-    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True
-    )
-    return head.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
-
-
 @app.local_entrypoint()
 def phase3_gpu(gpu: str = "A10", margin_budget: int = 16, repeats: int = 3) -> None:
     """Margin suite with every prompt chunked, then the micro-benchmark (off, on-256/512/1024)."""
     budgets: list[int | None] = [None, 256, 512, 1024]
-    r = run_phase3_gpu.with_options(gpu=gpu).remote(margin_budget, budgets, repeats, _git_commit())
+    r = run_phase3_gpu.with_options(gpu=gpu).remote(margin_budget, budgets, repeats, git_commit())
     m = r["margin"]
     suffix = f"_mixed{margin_budget}"
     Path(f"docs/data/tau_calibration{suffix}.json").write_text(
@@ -361,3 +378,26 @@ def phase3_gpu(gpu: str = "A10", margin_budget: int = 16, repeats: int = 3) -> N
     path = out / f"stall_{gpu_tag}_{mb['meta']['commit']}.json"
     path.write_text(json.dumps(mb, indent=1) + "\n")
     print(f"microbench: gpu={mb['meta']['gpu']} seconds={mb['meta']['seconds']} -> {path}")
+
+
+@app.local_entrypoint()
+def benchmark_gpu_checks(mixed_budget: int = 16) -> None:
+    """Smoke run, calibration, and the margin suite (off, then on with every prompt chunked)
+    on the benchmark GPU (L40S), all in one container."""
+    r = run_benchmark_gpu_checks.remote(mixed_budget)
+    tag = r["gpu"].replace("NVIDIA ", "").replace(" ", "_").lower()
+    data = Path("docs/data")
+    Path(data / f"smoke_{tag}.json").write_text(json.dumps(r["smoke"], indent=2) + "\n")
+    Path(data / f"tau_calibration_{tag}.json").write_text(
+        json.dumps(r["off"]["calibration"], indent=2) + "\n"
+    )
+    for name, part in (("", r["off"]), (f"_mixed{mixed_budget}", r["on"])):
+        if part["margin_report"]:
+            Path(data / f"margin_suite_{tag}{name}.json").write_text(
+                json.dumps(part["margin_report"], indent=2) + "\n"
+            )
+        print(part["output"])
+        print(f"margin{name}: returncode={part['returncode']} seconds={part['margin_seconds']}")
+    print(f"gpu={r['gpu']} driver={r['smoke']['driver']} seconds={r['seconds']}")
+    print(r["smoke"]["memory"])
+    print(r["smoke"]["outputs"])
