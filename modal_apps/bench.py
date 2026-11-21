@@ -65,6 +65,10 @@ vllm_image = (
     .add_local_python_source("benchmarks")
 )
 
+# stallfree's benchmark image: the development GPU image plus py-spy for the one profiling run.
+PY_SPY = "py-spy==0.4.3"
+stallfree_image = gpu_image.pip_install(PY_SPY)
+
 RESOURCES: dict[str, Any] = {
     "gpu": BENCH_GPU,
     "cpu": CPU,
@@ -118,8 +122,9 @@ def _run_system(
         path.write_bytes(blob)
         trace_paths[seed] = path
         trace_hashes[seed] = trace_sha256(loads(blob))
-    sys_enum = driver.System(system)
-    cmd = driver.server_command(sys_enum, MODEL_DIR)
+    sys_enum, budget = driver.resolve(system)
+    profiling = any("profile" in p for p in points)
+    cmd = driver.server_command(sys_enum, MODEL_DIR, budget=budget, ptraceable=profiling)
     flag_check = _vllm_flag_check(cmd) if system.startswith("vllm") else None
     base_url = f"http://127.0.0.1:{driver.PORT}/v1"
     log_path = work / "server.log"
@@ -154,6 +159,7 @@ def _run_system(
                     "trace_seed": seed,
                     "trace_sha256": trace_hashes[seed],
                 }
+                spec = driver.ProfileSpec(**p["profile"]) if "profile" in p else None
                 driver.run_point(
                     base_url=base_url,
                     server_pid=proc.pid,
@@ -161,6 +167,7 @@ def _run_system(
                     out=out,
                     loadgen_args=args,
                     run_meta=run_meta,
+                    profile=spec,
                 )
     except Exception as exc:
         log = log_path.read_text(errors="replace") if log_path.exists() else ""
@@ -179,7 +186,7 @@ def _run_system(
     return {str(f.relative_to(out_root)): f.read_bytes() for f in files}
 
 
-@app.function(image=gpu_image, **RESOURCES)
+@app.function(image=stallfree_image, **RESOURCES)
 def run_stallfree(
     system: str, points: list[dict[str, Any]], traces: dict[int, bytes], meta: dict[str, Any]
 ) -> dict[str, bytes]:
@@ -241,16 +248,19 @@ def _label(mult: float) -> str:
 
 
 @app.local_entrypoint()
-def saturation(concurrency: int = SATURATION_CONCURRENCY, seed: int = SEEDS[0]) -> None:
-    """Closed-loop saturation throughput of stallfree-off; writes saturation.json."""
+def saturation(
+    system: str = "stallfree-off", concurrency: int = SATURATION_CONCURRENCY, seed: int = SEEDS[0]
+) -> None:
+    """Closed-loop saturation throughput of ``system``. stallfree-off's result
+    (saturation.json) sets the sweep rates; any other system's is reported separately."""
     traces = _traces([seed], SATURATION_TRACE_REQUESTS)
     point = {"mode": "closed", "label": f"c{concurrency}", "concurrency": concurrency, "seed": seed}
-    files = run_stallfree.remote("stallfree-off", [point], traces, _meta("saturation"))
+    files = _runner(system).remote(system, [point], traces, _meta("saturation"))
     _write(files, "saturation")
-    summary_rel = f"stallfree-off/c{concurrency}/seed{seed}.summary.json"
+    summary_rel = f"{system}/c{concurrency}/seed{seed}.summary.json"
     summary = json.loads(files[summary_rel])
     result = {
-        "system": "stallfree-off",
+        "system": system,
         "concurrency": concurrency,
         "seed": seed,
         "request_throughput": summary["request_throughput"],
@@ -259,12 +269,19 @@ def saturation(concurrency: int = SATURATION_CONCURRENCY, seed: int = SEEDS[0]) 
         "measure_s": summary["measure_s"],
         "source": summary_rel,
     }
-    SATURATION_FILE.write_text(json.dumps(result, indent=1) + "\n")
+    path = SATURATION_FILE
+    if system != "stallfree-off":
+        path = SATURATION_FILE.with_name(f"saturation_{system}.json")
+    path.write_text(json.dumps(result, indent=1) + "\n")
     print(json.dumps(result, indent=1))
 
 
 def _sweep(
-    systems: list[str], mults: list[float], seeds: list[int], group: str
+    systems: list[str],
+    mults: list[float],
+    seeds: list[int],
+    group: str,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, list[Path]]:
     """One container per (system, seed); each runs every rate in order. Containers run in
     parallel; each server runs alone in its own container."""
@@ -284,6 +301,7 @@ def _sweep(
                     "rate": rates[m],
                     "rate_multiplier": m,
                     "seed": seed,
+                    **(extra or {}),
                 }
                 for m in mults
             ]
@@ -336,3 +354,32 @@ def vllm_image_versions() -> dict[str, str]:
 def check_vllm_image() -> None:
     """Build the vLLM image and print its package versions (no GPU)."""
     print(json.dumps(vllm_image_versions.remote(), indent=1))
+
+
+@app.local_entrypoint()
+def sweep(rates: str = "0.2,0.5,0.8,1.0,1.2", repeats: int = 3) -> None:
+    """The full sweep: all four systems, every rate, ``repeats`` seeds; 12 containers."""
+    mults = [float(x) for x in rates.split(",")]
+    systems = ["stallfree-off", "stallfree-on", "vllm", "vllm-eager"]
+    written = _sweep(systems, mults, list(SEEDS[:repeats]), "")
+    for key, paths in sorted(written.items()):
+        print(key, len(paths), "files")
+
+
+@app.local_entrypoint()
+def budgets(budgets: str = "256,1024,2048", rate: float = 0.8, repeats: int = 3) -> None:
+    """stallfree-on with other token budgets at one rate (512 comes from the main sweep)."""
+    systems = [f"stallfree-on-b{b}" for b in budgets.split(",")]
+    written = _sweep(systems, [rate], list(SEEDS[:repeats]), "budget")
+    for key, paths in sorted(written.items()):
+        print(key, len(paths), "files")
+
+
+@app.local_entrypoint()
+def profile(rate: float = 0.8, seed: int = SEEDS[0], delay_s: float = 40.0) -> None:
+    """One py-spy profile of the stallfree-on server during a normal run at ``rate``; not part
+    of the results (written to benchmarks/data/profile/)."""
+    extra = {"profile": {"delay_s": delay_s, "duration_s": 60.0, "rate": 100, "native": True}}
+    written = _sweep(["stallfree-on"], [rate], [seed], "profile", extra)
+    for key, paths in sorted(written.items()):
+        print(key, [p.name for p in paths])

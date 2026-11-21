@@ -56,18 +56,39 @@ class System(StrEnum):
     VLLM_EAGER = "vllm-eager"
 
 
-def server_command(system: System, model_dir: str, port: int = PORT) -> list[str]:
+BUDGET_SUFFIX = "-b"  # "stallfree-on-b256": mixed batching with a 256-token budget
+
+
+def resolve(name: str) -> tuple[System, int | None]:
+    """A system name, optionally with a token budget: ``stallfree-on-b1024``."""
+    if BUDGET_SUFFIX in name and name.startswith(System.STALLFREE_ON.value):
+        base, budget = name.rsplit(BUDGET_SUFFIX, 1)
+        return System(base), int(budget)
+    return System(name), None
+
+
+def server_command(
+    system: System,
+    model_dir: str,
+    port: int = PORT,
+    budget: int | None = None,
+    ptraceable: bool = False,
+) -> list[str]:
     """The server command line. Settings that exist in both engines are matched: model
     length, sequence limit, token budget (for chunked prefill), memory fraction, bf16, and no
-    prefix caching (stallfree has none)."""
+    prefix caching (stallfree has none). ``budget`` overrides stallfree-on's token budget;
+    ``ptraceable`` starts stallfree through the launcher that lets a profiler attach."""
     common = ["--served-model-name", SERVED_MODEL, "--max-model-len", str(MAX_MODEL_LEN)]
     common += ["--max-num-seqs", str(MAX_NUM_SEQS), "--host", "127.0.0.1", "--port", str(port)]
     if system in (System.STALLFREE_OFF, System.STALLFREE_ON):
-        cmd = [sys.executable, "-m", "stallfree.server.api", "--model", model_dir, *common]
+        module = ["stallfree.server.api"]
+        entry = ["-m", "benchmarks.ptraceable", *module] if ptraceable else ["-m", *module]
+        cmd = [sys.executable, *entry, "--model", model_dir, *common]
         cmd += ["--device", "cuda", "--attention", "flash", "--dtype", "bfloat16"]
         cmd += ["--max-queued-requests", str(MAX_QUEUED)]
         if system is System.STALLFREE_ON:
-            return [*cmd, "--enable-mixed-batching", "--max-num-batched-tokens", str(MIXED_BUDGET)]
+            tokens = str(budget or MIXED_BUDGET)
+            return [*cmd, "--enable-mixed-batching", "--max-num-batched-tokens", tokens]
         return [*cmd, "--max-num-batched-tokens", str(OFF_PREFILL_CAP)]
     cmd = ["vllm", "serve", model_dir, *common, "--dtype", "bfloat16"]
     cmd += ["--max-num-batched-tokens", str(MIXED_BUDGET), "--disable-prefix-caching"]
@@ -215,6 +236,43 @@ def metrics_text(base_url: str) -> str | None:
         return None
 
 
+@dataclass
+class ProfileSpec:
+    """A py-spy recording of the server: start ``delay_s`` after the load generator starts,
+    record ``duration_s`` at ``rate`` Hz, every thread, native frames if possible."""
+
+    delay_s: float = 40.0
+    duration_s: float = 60.0
+    rate: int = 100
+    native: bool = True
+    result: dict[str, Any] = field(default_factory=dict)
+
+
+def record_profile(pid: int, out: Path, spec: ProfileSpec) -> None:
+    """Run py-spy against ``pid``; on failure with native frames, retry once without them.
+    The outcome (command, return code, stderr tail) goes into ``spec.result``."""
+    time.sleep(spec.delay_s)
+    attempts = [True, False] if spec.native else [False]
+    for native in attempts:
+        cmd = ["py-spy", "record", "--pid", str(pid), "--duration", str(int(spec.duration_s))]
+        cmd += ["--rate", str(spec.rate), "--format", "raw", "--threads", "--full-filenames"]
+        cmd += ["-o", str(out)]
+        if native:
+            cmd.append("--native")
+        start = time.time()
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        spec.result = {
+            "command": cmd,
+            "returncode": proc.returncode,
+            "stderr": proc.stderr[-2000:],
+            "started_wall": start,
+            "seconds": round(time.time() - start, 1),
+            "native": native,
+        }
+        if proc.returncode == 0:
+            return
+
+
 def run_point(
     *,
     base_url: str,
@@ -224,8 +282,10 @@ def run_point(
     loadgen_args: Sequence[str],
     run_meta: dict[str, Any],
     sample_interval: float = SAMPLE_INTERVAL_S,
+    profile: ProfileSpec | None = None,
 ) -> dict[str, Any]:
-    """One measured run: the load generator in a subprocess, sampled; writes the run's files."""
+    """One measured run: the load generator in a subprocess, sampled; writes the run's files.
+    With ``profile``, py-spy records the server for part of the run (``<stem>.pyspy.txt``)."""
     out.parent.mkdir(parents=True, exist_ok=True)
     gpu_before = gpu_info()
     metrics_before = metrics_text(base_url)
@@ -235,8 +295,16 @@ def run_point(
     lg = subprocess.Popen(cmd)
     sampler = CpuSampler(server_pid, lg.pid, sample_interval, gpu=gpu_before is not None)
     sampler.start()
+    profiler = None
+    if profile is not None:
+        profiler = threading.Thread(
+            target=record_profile, args=(server_pid, out.with_suffix(".pyspy.txt"), profile)
+        )
+        profiler.start()
     rc = lg.wait()
     samples = sampler.stop()
+    if profiler is not None:
+        profiler.join()
     if rc != 0:
         raise RuntimeError(f"load generator exited with {rc}")
     with out.with_suffix(".cpu.jsonl").open("w") as f:
@@ -250,6 +318,8 @@ def run_point(
         "gpu_before": gpu_before,
         "gpu_after": gpu_info(),
     }
+    if profile is not None:
+        meta["profile"] = {**profile.__dict__, "result": profile.result}
     if metrics_before is not None:
         meta["metrics_before"] = metrics_before
         meta["metrics_after"] = metrics_text(base_url)
