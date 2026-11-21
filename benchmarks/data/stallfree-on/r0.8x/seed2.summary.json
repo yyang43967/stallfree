@@ -1,0 +1,8 @@
+{
+ "mode": "open",
+ "t0_wall": 1795237075.4830282,
+ "rate": 6.413333333333334,
+ "warmup_requests": 185,
+ "measured_requests": 759,
+ "max_send_lag_s": 0.000839271031459532
+}

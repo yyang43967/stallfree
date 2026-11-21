@@ -1,0 +1,10 @@
+{
+ "system": "stallfree-off",
+ "concurrency": 256,
+ "seed": 1,
+ "request_throughput": 8.016666666666667,
+ "output_token_throughput_completed": 2258.991666666667,
+ "completed_in_window": 962,
+ "measure_s": 120.0,
+ "source": "stallfree-off/c256/seed1.summary.json"
+}

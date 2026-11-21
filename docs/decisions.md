@@ -32,6 +32,12 @@ Template:
 | 2026-11-17 | A10G (A10 requested) | ~6 (366 s function wall time) | 0.139 | Phase 3: calibration + margin suite with mixed batching on, budget 64 |
 | 2026-11-18 | A10 | ~5 (265 s margin + 40 s micro-benchmark) | 0.121 | Phase 3: calibration + margin suite with every prompt chunked (budget 16), then the stall micro-benchmark |
 | | | | **0.260** | **Phase 3 total** (estimate 0.35); running total 0.589 |
+| 2026-11-20 | L40S | ~5 (268 s function time) | 0.18 | Phase 4: smoke, calibration, margin suite flag off and with every prompt chunked, in one container |
+| 2026-11-20 | L40S (8 CPU, 32 GiB) | ~31 billed GPU minutes | 1.31 | Phase 4: saturation closed loop, four-system dry run, and nine short vLLM start-up failures (flag spelling 3, slim-image FlashInfer JIT 5 while collecting its error, package shadowing 1) before the official image worked |
+| | | | **1.49** | **Phase 4 stage 1 total** (cap 3.00); running total 2.08 |
+| 2026-11-20 | CPU only | ~3 | < 0.01 | Phase 4: checking that py-spy can attach inside a Modal container |
+| 2026-11-20 | L40S (8 CPU, 32 GiB) | ~176 billed GPU minutes | 10.55 | Phase 4 stage 2: full sweep (12 containers), budget sweep (9), vLLM closed-loop saturation, two profiling runs |
+| | | | **10.55** | **Phase 4 stage 2 total** (cap 15.00, estimate about 12); running total 12.63 |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
@@ -928,3 +934,217 @@ how much each one costs.
   are rejected with a 400. A non-streaming request is not cancelled when its client disconnects.
 - **Single-threaded engine loop:** scheduling, detokenization, and HTTP handling share one Python
   process with the model's step running in a worker thread.
+
+## Phase 4 — Benchmark
+
+### bf16 correctness on the benchmark GPU (L40S)
+- **Context:** τ = 0.5 was calibrated on an A10. The benchmark runs on an NVIDIA L40S (driver
+  610.57.04 for this run), so calibration and the margin suite were repeated there, in one
+  container: smoke run, calibration, margin suite with mixed batching off, then again with mixed
+  batching on and a 16-token budget so every prompt is chunked.
+- **Result:**
+
+  | Run | Engine diverged (single / batched) | Rule failures | Largest gap at a divergence |
+  |---|---|---|---|
+  | Flag off | 16 / 15 of 32 | 0 | 0.375 |
+  | Flag on, budget 16 (all 32 prompts chunked; batched: 2-11 chunks) | 15 / 14 of 32 | 0 | 0.375 |
+  | Hugging Face against itself (B eager batch 8 / S SDPA / F fp32) | 14 / 16 / 13 of 32 | - | 0.25 |
+
+  Teacher-forced: the top-1 token matched at all 1,437 positions whose gap exceeds τ (of 1,689).
+  The preemption scenario passed. The engine's divergence rate is within the range of Hugging
+  Face's own self-divergence on the same GPU, so τ = 0.5 stands on the L40S.
+- **Evidence:** `docs/data/smoke_l40s.json`, `tau_calibration_l40s.json`,
+  `margin_suite_l40s.json`, `margin_suite_l40s_mixed16.json`.
+
+### Prompt text and prompt lengths
+- **Context:** Prompts need realistic tokenization, no shared prefixes, and exact lengths that
+  both servers count the same way.
+- **Decision:** Token ids are sampled at random offsets from *Pride and Prejudice* (public domain,
+  1813; Project Gutenberg #1342 with every Project Gutenberg, edition, and illustration text
+  removed; SHA-256 pinned in `benchmarks/workload.py`, `benchmarks/data/text/README.md`, a test,
+  and every `run.json`). A prompt's length is the length of the **templated** prompt, the number
+  the server reports as `usage.prompt_tokens`: the slice is decoded, re-encoded through the chat
+  template, and lengthened or shortened until the count is exact. Every request is checked against
+  the server's count.
+- **Why templated length:** It is the number the engine actually prefills, and the one both
+  servers report, so the check is end to end. The Qwen3 template adds 8 tokens.
+- **Result:** 0 mismatches in every run so far on both servers, including vLLM, whose image has
+  transformers 5.20.2 against stallfree's 5.23.0.
+
+### Requests: greedy, `ignore_eos`, streamed with usage
+- **Decision:** Every request streams with `temperature: 0`, `ignore_eos: true`, `max_tokens` from
+  the trace, and `stream_options.include_usage`. Greedy decoding removes sampling as a variable;
+  `ignore_eos` makes every system generate exactly the same number of tokens; usage gives the
+  server-side token counts. The analysis checks `completion_tokens == max_tokens` for every
+  request.
+
+### Trace replay, warm-up, and the measured window
+- **Decision:** One trace per seed (seeds 1, 2, 3), generated locally with the pinned tokenizer and
+  sent to every container, so all systems replay byte-identical requests (the trace's SHA-256 is
+  in each `run.json` and checked to match across systems). Gaps are unit-mean exponentials scaled
+  by 1/λ, so every rate replays the same requests in the same order. Requests arriving in the first
+  30 s are warm-up; then the longer of 300 requests and 120 s of arrivals is measured; the run
+  waits for every request to finish. Each (system, seed) gets its own container, which starts the
+  server once and runs the rates from lowest to highest.
+- **Throughput accounting:** request and output-token throughput are measured requests (and their
+  tokens) divided by the window from the first measured send to the last measured completion.
+  That window includes the drain at the end, so below saturation the request throughput reads
+  lower than the offered rate, more so for a system with long end-to-end latency.
+
+### Saturation throughput (closed loop)
+- **Decision:** 256 concurrent clients (= `max_num_seqs`), each sending its next request as soon
+  as its last one finishes, cycling through the seed-1 trace; 30 s warm-up, then requests that
+  finish within 120 s are counted. Requests still running at the end are cancelled.
+- **Result:** stallfree-off saturates at **8.02 req/s** (962 requests, 2,259 output tok/s). The
+  sweep rates are therefore 1.60, 4.01, 6.41, 8.02, and 9.62 req/s.
+- **Observation:** during the closed loop the stallfree server process used 100-113% of one core
+  (mean 102%) while the GPU was busy 48% of the time, at a TPOT of 116 ms: with 256 sequences the
+  engine is limited by Python on the CPU, not by the GPU.
+- **Evidence:** `benchmarks/data/saturation/`.
+
+### Labelling saturated points
+- **Decision:** An open-loop point is labelled saturated when the median TTFT of the last fifth of
+  measured requests (in send order) is more than twice that of the first fifth.
+- **Why:** Below saturation the queue is stationary and the ratio stays near 1; above it the queue
+  grows for the whole run. Comparing achieved throughput with the offered rate does not work here,
+  because the measured window includes the drain (see above).
+
+### vLLM configuration
+- **Context:** The comparison should be against vLLM as it is normally deployed, with only the
+  settings that change what is measured matched.
+- **Decision:** vLLM 0.33.0 runs in its official server image (`vllm/vllm-openai:v0.33.0`; torch
+  2.14.0+cu130). Matched with stallfree: `--max-model-len 4096`, `--max-num-seqs 256`,
+  `--gpu-memory-utilization 0.9`, `--dtype bfloat16`, and `--max-num-batched-tokens 512`, the same
+  token budget as stallfree with mixed batching on (vLLM always chunks prefills). Prefix caching
+  is off (`--disable-prefix-caching`; stallfree has none and the workload shares no prefixes).
+  Everything else is vLLM's default: CUDA graphs, `torch.compile`, its own sampler kernels, and
+  separate API-server and engine-core processes. `vllm-eager` adds only `--enforce-eager`.
+- **Why the official image:** A pip-only install on the slim base image failed at startup: vLLM's
+  default sampler JIT-compiles a FlashInfer kernel with `nvcc`, which that image does not have.
+  Turning the FlashInfer sampler off would have moved vLLM away from its defaults; the official
+  image ships what the defaults need.
+- **Safeguard:** Before starting vLLM, the container checks that every flag in the command appears
+  in `vllm serve --help=all` and stops otherwise. This caught that 0.33.0 spells the prefix-cache
+  switch `--disable-prefix-caching` (not `--no-enable-prefix-caching`).
+
+### stallfree configuration in the benchmark
+- **Decision:** `--max-num-seqs 256 --max-model-len 4096`, automatic KV sizing at 0.9 of GPU
+  memory (1,474 blocks of 256 tokens on the L40S), flash attention, bf16. Mixed batching off uses
+  `--max-num-batched-tokens 4096` (the prefill cap); on uses 512. `--max-queued-requests` is set
+  far above any load so that stallfree never answers 503 (vLLM has no such limit).
+
+### Raw data format
+- **Decision:** Per-request records are gzipped JSON lines with timestamps rounded to the
+  microsecond (`<seed>.jsonl.gz`), next to the CPU samples, the load generator's summary, and a
+  `run.json` with versions, GPU and driver, clocks before and after, CPU and memory requests,
+  flags, trace seed and SHA-256, the source text's SHA-256, and the commit. The server's log is
+  stored per container (gzipped).
+- **Why:** Every chunk's arrival time is kept, so any metric can be recomputed. Uncompressed, one
+  saturation run was 5.8 MB; gzipped with microsecond times about 1.1 KB per request, which puts
+  the full sweep at an estimated 60 MB.
+
+### CPU sampling
+- **Decision:** The driver process (neither server nor load generator) samples, every second, the
+  CPU use of each process in the server's tree and of the load generator with `psutil`, plus GPU
+  utilization and SM clock with `nvidia-smi`. Samples are aligned to each run's measured window by
+  wall-clock time. A run is flagged when the load generator averages over 80% of one core.
+- **Result so far:** the load generator averaged 15-20% (max 31%) in every run, so no run is
+  flagged.
+
+### Driver versions on Modal
+- **Observation:** Modal places containers on different hosts, and the dry run landed on two NVIDIA
+  driver versions (610.57.04 and 620.70.06), both with SM clocks at their 2,520 MHz maximum before
+  and after each run. The driver cannot be pinned on Modal; it is recorded in every `run.json` and
+  in the per-run table.
+
+### Dry run (one rate, one repeat)
+- **Result** (6.41 req/s = 0.8 x saturation, seed 1; `benchmarks/results/dryrun.md`): every
+  system completed all 721 measured requests with no errors, no prompt-token mismatches, and no
+  `ignore_eos` violations. Median TPOT: stallfree-off 87.8 ms, stallfree-on 55.7 ms, vLLM 3.9 ms,
+  vLLM eager 22.8 ms. Median TTFT: 90, 258, 20, and 80 ms. These are single runs; the full sweep
+  repeats each point three times.
+- **Early reading of the gap to vLLM:** vLLM eager is 2.4 times faster per output token than
+  stallfree with mixed batching on, and CUDA graphs make vLLM another 5.8 times faster. stallfree's
+  server process sits at about one full core while the GPU is 40% busy; vLLM's engine core uses
+  111% and keeps the GPU 99% busy. The full sweep will quantify this per rate.
+
+### Full sweep, budget sweep, and saturation of vLLM
+- **What ran:**
+  - 4 systems x 5 rates x 3 seeds, one container per (system, seed): 60 runs.
+  - stallfree-on with budgets of 256, 1,024 and 2,048 tokens at 0.8 x, with 3 seeds each.
+  - A closed-loop saturation run of vLLM.
+  - All 60 sweep runs passed every sanity check (no errors, no prompt-token mismatches, no
+    `ignore_eos` violations). The load generator averaged at most 27% of a core (peak 61%).
+- **Trace identity:** all four systems share one trace hash per seed. The budget runs used a
+  shorter trace from the same seeds (sized for 0.8 x instead of 1.2 x), so their hashes differ.
+  The replayed requests were checked to be identical: same indices, prompt lengths, output lengths,
+  and send times, request by request.
+- **Results** are in `benchmarks/results.md`; the tables come from `benchmarks/summarize.py` and
+  the plots from `benchmarks/plot.py`.
+
+### Host types on Modal
+- **Observation:** containers landed on two host types, told apart by their NVIDIA driver version
+  (610.57.04 and 620.70.06). stallfree is 1.8 to 2.4 times faster per token on the 610 hosts.
+  vLLM with CUDA graphs is the same on both, and every vLLM-eager run landed on 620 hosts.
+  Driver version and host CPU are confounded; these runs did not record the CPU model.
+- **Decision:** report the host split instead of hiding it.
+  - A table split by host type is generated with the results.
+  - The stallfree medians are 620-host values (two of three repeats), the same host type as vLLM
+    eager.
+  - The saturation run that set the rates was on a 610 host; this is stated next to the
+    saturated points.
+  - From now on every `run.json` records the CPU model and kernel version.
+- **Not done:** a rerun pinned to one host type. Modal does not let a function choose the host
+  CPU directly; pinning would need probing which cloud or region gives which host type.
+
+### Token budget on the L40S
+- **Result:** at 0.8 x on the same host type (620), 1,024 tokens gave half the TTFT of 512 (p50
+  107-113 against 207-265 ms) with a similar ITL p99 (64-84 against 69-76 ms). 256 saturates at
+  this rate (TTFT p50 14.5 s). 2,048 let ITL p99 reach 97 ms.
+- **Decision:** the sweep keeps 512, which was fixed before it ran. 1,024 is the better budget for
+  this GPU and workload, and the README says so.
+- **Outcome for "Token budget defaults":** the A10 recommendation (512) does not carry over to the
+  L40S.
+
+### Profiling the stallfree server
+- **Context:** stallfree's server uses one core while the GPU is half idle, so the gap to vLLM
+  needs evidence of where that core goes.
+- **Getting py-spy to attach:** in the benchmark sandbox a process may only be traced by its own
+  ancestors. The profiling run therefore starts the server through `benchmarks/ptraceable.py`,
+  which calls `prctl(PR_SET_PTRACER, ANY)` and then runs the server module unchanged. py-spy
+  (0.4.3, in the stallfree benchmark image only) then attaches by PID 40 s into a normal run at
+  0.8 x, after warm-up, for 60 s. The profiling runs are separate from the results.
+- **Attribution (`benchmarks/profile_summary.py`):**
+  - A sample's component is decided by its innermost stallfree frame; samples without one are
+    assigned by library.
+  - Its state comes from the innermost native frames: `epoll_wait` is the event loop waiting;
+    a condition wait or lock acquire is waiting for the GIL or a lock; anything else is running.
+    This sandbox reports blocked threads as active, so this step is needed.
+  - Running samples / (rate x duration) gave 0.99 cores, matching psutil's ~100%.
+- **Findings** (native profile, `benchmarks/results/profile.md`):
+  - Shares of the server's CPU: model forward 34%; batch metadata, sampling and scheduling 8%;
+    prompt tokenization 22%; HTTP/SSE 17%; event loop 16.5%.
+  - Within model forward, the innermost frame is PyTorch C++ dispatch in 42% of samples,
+    malloc/locks in 19%, the CUDA driver in 18%, and Python in 17%.
+  - The step threads wait for the GIL in 12% of their samples.
+- **Caveat:** native-frame sampling pauses the process and slowed the profiled run from 28 to
+  57 ms TPOT, pushing it into saturation. A non-blocking, Python-only profile slowed the server
+  less and agrees on the model-forward share (35%). In this sandbox, though, it cannot see Rust
+  tokenizer time and counts idle `epoll` waits as running, so it is not used for the other shares.
+
+### Gaps to vLLM, measured
+These are the measured counterparts of "Known gaps to vLLM before the benchmark".
+- **Overall, at 0.8 x:** vLLM's TPOT is 3.9 ms against stallfree-on's 54.0 ms (14x), and its TTFT
+  is 20 against 207 ms. Its closed-loop saturation is 18.2 against 8.0 req/s on the same host type
+  (2.3x).
+- **CUDA graphs:** 5.4x within vLLM (eager 20.9 ms against 3.9 ms). The profile shows stallfree's
+  model forward as host-side dispatch and launch work, which is what graphs remove.
+- **The rest of the engine:** vLLM eager against stallfree-on is 2.6x.
+  - vLLM runs the API server (tokenization, detokenization, HTTP) in its own process (8-28% of a
+    core) beside an engine core that uses 128-138%.
+  - stallfree's step threads get about 42% of one GIL-bound core, because 58% goes to the asyncio
+    thread.
+  - This is consistent with a factor of about two but is not separated from vLLM's other per-step
+    differences by this benchmark.
+- **Unexplained:** stallfree's global stalls of 150-190 ms (47 ms on the faster host type) do not
+  line up with long-prompt arrivals. Finding the cause needs per-step timing inside the server.

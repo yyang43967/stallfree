@@ -1,0 +1,10 @@
+{
+ "system": "vllm",
+ "concurrency": 256,
+ "seed": 1,
+ "request_throughput": 18.216666666666665,
+ "output_token_throughput_completed": 5139.425,
+ "completed_in_window": 2186,
+ "measure_s": 120.0,
+ "source": "vllm/c256/seed1.summary.json"
+}

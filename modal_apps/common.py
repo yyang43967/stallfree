@@ -33,6 +33,7 @@ PINNED = [
     "uvicorn==0.54.0",
     "openai==3.53.0",
     "httpx==0.28.1",
+    "psutil==7.2.2",
 ]
 
 weights_volume = modal.Volume.from_name("stallfree-weights", create_if_missing=True)
@@ -41,15 +42,34 @@ download_image = modal.Image.debian_slim(python_version=PYTHON).pip_install(
     "huggingface-hub==2.4.0"
 )
 
-gpu_image = (
+# Everything except local source files; images that add packages build on this.
+gpu_base_image = (
     modal.Image.debian_slim(python_version=PYTHON)
     .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu130")
     .pip_install(FLASH_ATTN_WHEEL)
     .pip_install(*PINNED)
     .env({"HF_HUB_OFFLINE": "1", "STALLFREE_MODEL_DIR": MODEL_DIR})
-    .add_local_file("pyproject.toml", "/root/pyproject.toml")
-    .add_local_dir("tests", "/root/tests")
-    .add_local_file("benchmarks/__init__.py", "/root/benchmarks/__init__.py")
-    .add_local_file("benchmarks/microbench.py", "/root/benchmarks/microbench.py")
-    .add_local_python_source("stallfree")
 )
+
+
+def with_sources(image: modal.Image) -> modal.Image:
+    """Add the project's files last, so editing them does not rebuild the image."""
+    return (
+        image.add_local_file("pyproject.toml", "/root/pyproject.toml")
+        .add_local_dir("tests", "/root/tests")
+        .add_local_python_source("stallfree", "benchmarks")  # Python files only, no data
+    )
+
+
+gpu_image = with_sources(gpu_base_image)
+
+
+def git_commit() -> str:
+    """Short commit of the local checkout, with ``-dirty`` if tracked files have changes."""
+    import subprocess
+
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True
+    )
+    return head.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")

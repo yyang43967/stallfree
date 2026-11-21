@@ -1,0 +1,13 @@
+{
+  "gpu": "NVIDIA L40S",
+  "driver": "610.57.04",
+  "torch": "2.10.0+cu130",
+  "cuda": "13.0",
+  "flash_attn": "2.8.3",
+  "memory": "total 47.40 GiB, in use 2.22 GiB, activation peak 0.11 GiB (4096 tokens), 1474 blocks of 28.0 MiB = 40.30 GiB KV cache",
+  "outputs": [
+    "The capital of France is **Paris**.<|im_end|>",
+    "A pot of simmering soup  \nStirring gently, a flame  \nA kitchen's quiet song.<|im_end|>"
+  ],
+  "seconds": 5.6
+}

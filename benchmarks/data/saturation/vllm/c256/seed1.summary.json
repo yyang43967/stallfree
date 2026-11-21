@@ -1,0 +1,10 @@
+{
+ "mode": "closed",
+ "t0_wall": 1795236766.49002,
+ "concurrency": 256,
+ "warmup_s": 30.0,
+ "measure_s": 120.0,
+ "completed_in_window": 2186,
+ "request_throughput": 18.216666666666665,
+ "output_token_throughput_completed": 5139.425
+}
