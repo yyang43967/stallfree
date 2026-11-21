@@ -15,11 +15,9 @@ Every token the engine produces is checked against Hugging Face transformers: ex
 CPU, and with a calibrated tolerance in bf16 on GPU. Single GPU, single model; no custom CUDA
 kernels (PyTorch ops and FlashAttention-2 only).
 
-**Status:** the engine, server, and mixed batching are complete and tested. The latency
-benchmark against vLLM over HTTP on an L40S is in [benchmarks/results.md](benchmarks/results.md):
-vLLM is faster on every metric at every rate measured (median time per output token 3.9 ms
-against 54 ms at 0.8 x stallfree's saturation rate), and the results explain where the gap comes
-from. Mixed batching cuts stallfree's p99 inter-token latency from 243 ms to 69 ms there.
+**Status:** complete. The engine, server, and mixed batching are tested, and the serving
+benchmark against vLLM is below. vLLM is faster on every metric at every rate measured, and the
+results explain where the gap comes from.
 
 ## What problem it solves
 
@@ -78,10 +76,56 @@ Design choices, the options considered, and the evidence for each are in
 | Teacher-forced check | GPU (Modal) | With the reference sequence fed in, the top-1 token matches at every position whose gap exceeds τ (1,451 of 1,451) |
 | Server | CPU, in CI; GPU (Modal) | The official `openai` client against a real server: streaming equals non-streaming, usage, 8 concurrent streams, disconnect frees all KV blocks, 503 when full |
 
-The CPU suite has 378 tests (`uv run pytest -m "not gpu"`); the GPU tests run on Modal. On an A10,
+The CPU suite has 399 tests (`uv run pytest -m "not gpu"`); the GPU tests run on Modal. On an A10,
 with every prompt chunked, the engine diverged from the reference on 17 of 32 prompts, all at
 near-ties, while Hugging Face run with a different kernel, batch size, or precision diverges from itself
 on 12 to 18 of the same 32 ([data](docs/data/margin_suite_mixed16.json)).
+
+## Serving benchmark against vLLM
+
+Four systems on one L40S: stallfree with mixed batching off and on (512-token budget), vLLM
+0.33.0 with its defaults, and vLLM with `--enforce-eager`. The workload is a seeded Poisson trace
+over HTTP in which one request in five has a 1,536-3,072-token prompt; it is designed to expose
+prefill stalls, not to model real traffic. There are five rates and three repeats per point, and
+every request's prompt and output lengths are checked against the server's own counts. Full
+results, methodology, and caveats are in [benchmarks/results.md](benchmarks/results.md), with
+plots in [benchmarks/plots/](benchmarks/plots/) and raw data in [benchmarks/data/](benchmarks/data/).
+
+At 0.8 x stallfree-off's saturation rate (6.41 req/s), median of three repeats with (min-max):
+
+| system | rate (req/s) | repeats | TTFT p50 (ms) | TTFT p99 (ms) | TPOT p50 (ms) | TPOT p99 (ms) | ITL p99 (ms) | ITL max (ms) | E2E p50 (s) | output tok/s | saturated |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| stallfree-off | 6.41 (0.8x) | 3 | 87.9 (49.7-97.4) | 244.0 (90.9-306.1) | 84.5 (38.5-100.1) | 117.9 (45.9-135.9) | 243.1 (88.8-310.1) | 449.3 (215.2-652.9) | 25.0 (10.3-26.6) | 1527.1 (1488.3-1551.3) | no |
+| stallfree-on | 6.41 (0.8x) | 3 | 206.8 (67.6-264.8) | 1090.8 (359.6-1207.4) | 54.0 (28.3-55.3) | 57.9 (31.8-63.9) | 68.6 (35.0-76.2) | 204.3 (163.4-245.3) | 14.8 (8.4-15.7) | 1529.1 (1461.3-1690.5) | no |
+| vllm | 6.41 (0.8x) | 3 | 19.9 (19.4-21.3) | 68.5 (65.0-78.7) | 3.9 (3.9-4.0) | 5.7 (5.7-6.2) | 6.8 (6.7-8.6) | 19.1 (15.5-28.1) | 1.1 (1.1-1.2) | 1758.7 (1675.5-1810.1) | no |
+| vllm-eager | 6.41 (0.8x) | 3 | 70.3 (69.1-72.9) | 231.9 (230.4-243.2) | 20.9 (20.7-21.3) | 21.3 (21.2-22.7) | 23.8 (23.8-24.6) | 53.1 (45.5-54.2) | 5.8 (5.8-6.3) | 1650.3 (1559.1-1701.1) | no |
+
+![Time per output token against rate](benchmarks/plots/tpot_vs_rate.png)
+
+- **Mixed batching works inside stallfree.** ITL p99 falls from 243 ms to 69 ms (3.5 times
+  lower). The cost is the time to first token: median 88 ms rises to 207 ms, and p99 244 ms to
+  1,091 ms.
+- **vLLM is faster on every metric at every rate.** Its median time per output token is 3.9 ms
+  against stallfree-on's 54.0 ms, 14 times faster. The gap splits in two:
+  - **CUDA graphs: 5.4 times.** vLLM eager against vLLM, 20.9 against 3.9 ms.
+  - **The rest of the engine: 2.6 times.** stallfree-on against vLLM eager.
+- **Evidence for the split.**
+  - stallfree's server process uses exactly one CPU core while the GPU is busy 24-57% of the
+    time.
+  - A py-spy profile ([benchmarks/results/profile.md](benchmarks/results/profile.md)) shows the
+    asyncio thread (prompt tokenization, HTTP/SSE, the event loop) taking 58% of that core.
+  - The engine-step threads get 42% and wait for the GIL in 12% of their samples.
+  - Model forward's CPU time is PyTorch dispatch, allocation, and kernel launches: the work CUDA
+    graphs remove.
+  - vLLM runs its API server in a separate process, which is consistent with the 2.6 times but
+    does not prove it.
+- **Profile caveat.** Native-frame sampling pauses the process, and it slowed the profiled run
+  from 28 to 57 ms per token. The shares come from that slowed server; a lighter Python-only
+  profile agrees on the model-forward share.
+- **Open gaps.** These are listed in the results:
+  - stallfree is 1.8-2.4 times faster on one of the two Modal host types. The medians above are
+    on the same host type as vLLM eager.
+  - Unexplained global stalls of up to about 200 ms.
 
 ## Micro-benchmark: a long prompt arrives during 16 decodes
 
@@ -200,6 +244,24 @@ STALLFREE_API_KEY=<key> uv run modal serve -m modal_apps.serve
 
 Stop it afterwards with `uv run modal app stop -y <app id>` and check `uv run modal app list`.
 
+The serving benchmark (L40S; about 4 container-hours for the full sweep):
+
+```bash
+uv run modal run -m modal_apps.bench::saturation
+```
+
+```bash
+uv run modal run -m modal_apps.bench::sweep
+```
+
+```bash
+uv run python -m benchmarks.summarize benchmarks/data --out benchmarks/results
+```
+
+```bash
+uv run python -m benchmarks.plot benchmarks/data --out benchmarks/plots
+```
+
 ## Repository layout
 
 ```
@@ -207,7 +269,7 @@ src/stallfree/     engine, scheduler, block manager, model, attention, server
 tests/unit/        component contracts (CPU)
 tests/integration/ end-to-end against Hugging Face, and the HTTP server (CPU)
 tests/gpu/         bf16 margin suite, flash vs reference, server concurrency (Modal)
-benchmarks/        micro-benchmark harness, raw data, generated results
+benchmarks/        workload and load generators, micro-benchmark, raw data, results, plots
 modal_apps/        Modal images and entry points
 docs/              decisions.md and the data behind every GPU result
 ```
