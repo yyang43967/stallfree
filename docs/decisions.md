@@ -32,6 +32,9 @@ Template:
 | 2026-11-17 | A10G (A10 requested) | ~6 (366 s function wall time) | 0.139 | Phase 3: calibration + margin suite with mixed batching on, budget 64 |
 | 2026-11-18 | A10 | ~5 (265 s margin + 40 s micro-benchmark) | 0.121 | Phase 3: calibration + margin suite with every prompt chunked (budget 16), then the stall micro-benchmark |
 | | | | **0.260** | **Phase 3 total** (estimate 0.35); running total 0.589 |
+| 2026-11-20 | L40S | ~5 (268 s function time) | 0.18 | Phase 4: smoke, calibration, margin suite flag off and with every prompt chunked, in one container |
+| 2026-11-20 | L40S (8 CPU, 32 GiB) | ~31 billed GPU minutes | 1.31 | Phase 4: saturation closed loop, four-system dry run, and six short vLLM start-up failures (flag spelling, slim-image FlashInfer JIT, package shadowing) before the official image worked |
+| | | | **1.49** | **Phase 4 stage 1 total** (cap 3.00); running total 2.08 |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
