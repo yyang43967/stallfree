@@ -35,6 +35,9 @@ Template:
 | 2026-11-20 | L40S | ~5 (268 s function time) | 0.18 | Phase 4: smoke, calibration, margin suite flag off and with every prompt chunked, in one container |
 | 2026-11-20 | L40S (8 CPU, 32 GiB) | ~31 billed GPU minutes | 1.31 | Phase 4: saturation closed loop, four-system dry run, and nine short vLLM start-up failures (flag spelling 3, slim-image FlashInfer JIT 5 while collecting its error, package shadowing 1) before the official image worked |
 | | | | **1.49** | **Phase 4 stage 1 total** (cap 3.00); running total 2.08 |
+| 2026-11-20 | CPU only | ~3 | < 0.01 | Phase 4: checking that py-spy can attach inside a Modal container |
+| 2026-11-20 | L40S (8 CPU, 32 GiB) | ~176 billed GPU minutes | 10.55 | Phase 4 stage 2: full sweep (12 containers), budget sweep (9), vLLM closed-loop saturation, two profiling runs |
+| | | | **10.55** | **Phase 4 stage 2 total** (cap 15.00, estimate about 12); running total 12.63 |
 
 Prices (Modal, checked 2026-11-15): L4 $0.000222/s (≈ $0.80/h), L40S $0.000542/s (≈ $1.95/h),
 H100 $0.001097/s (≈ $3.95/h). CPU $0.0000131/core/s, memory $0.00000222/GiB/s.
