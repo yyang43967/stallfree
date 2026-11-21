@@ -42,16 +42,26 @@ download_image = modal.Image.debian_slim(python_version=PYTHON).pip_install(
     "huggingface-hub==2.4.0"
 )
 
-gpu_image = (
+# Everything except local source files; images that add packages build on this.
+gpu_base_image = (
     modal.Image.debian_slim(python_version=PYTHON)
     .pip_install("torch==2.10.0", index_url="https://download.pytorch.org/whl/cu130")
     .pip_install(FLASH_ATTN_WHEEL)
     .pip_install(*PINNED)
     .env({"HF_HUB_OFFLINE": "1", "STALLFREE_MODEL_DIR": MODEL_DIR})
-    .add_local_file("pyproject.toml", "/root/pyproject.toml")
-    .add_local_dir("tests", "/root/tests")
-    .add_local_python_source("stallfree", "benchmarks")  # Python files only, no data
 )
+
+
+def with_sources(image: modal.Image) -> modal.Image:
+    """Add the project's files last, so editing them does not rebuild the image."""
+    return (
+        image.add_local_file("pyproject.toml", "/root/pyproject.toml")
+        .add_local_dir("tests", "/root/tests")
+        .add_local_python_source("stallfree", "benchmarks")  # Python files only, no data
+    )
+
+
+gpu_image = with_sources(gpu_base_image)
 
 
 def git_commit() -> str:

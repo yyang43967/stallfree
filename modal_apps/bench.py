@@ -34,8 +34,9 @@ from modal_apps.common import (
     MODEL_REVISION,
     WEIGHTS_DIR,
     git_commit,
-    gpu_image,
+    gpu_base_image,
     weights_volume,
+    with_sources,
 )
 
 app = modal.App("stallfree-bench")
@@ -67,7 +68,7 @@ vllm_image = (
 
 # stallfree's benchmark image: the development GPU image plus py-spy for the one profiling run.
 PY_SPY = "py-spy==0.4.3"
-stallfree_image = gpu_image.pip_install(PY_SPY)
+stallfree_image = with_sources(gpu_base_image.pip_install(PY_SPY))
 
 RESOURCES: dict[str, Any] = {
     "gpu": BENCH_GPU,
