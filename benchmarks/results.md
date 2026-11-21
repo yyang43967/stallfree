@@ -214,6 +214,33 @@ garbage collection, growth of the CUDA caching allocator, and event-loop blockin
 apart needs per-step timing inside the server, which is not recorded. They set stallfree-on's ITL
 max (about 200 ms) even at low load. vLLM's ITL max is 13-30 ms at every rate.
 
+## Open gaps
+
+Both of these are documented and left open; no rerun was made.
+
+1. **Host types.** stallfree's speed depends on which Modal host type a container lands on (driver
+   610.57.04 against 620.70.06, 1.8 to 2.4 times per token), and driver version and CPU model are
+   confounded in this data. Settling it needs runs pinned to one host type with the CPU model
+   recorded (every `run.json` records the CPU model from now on). Until then, compare stallfree
+   with vLLM eager only on the same host type, as the medians above do.
+2. **Global stalls.** stallfree-on's largest gaps (150-190 ms on 620 hosts, 47 ms on the 610
+   host) pause every stream at once and do not follow long-prompt arrivals. The hypotheses, and
+   the per-step timing that would tell them apart:
+   - **Python garbage collection.** A full collection holds the GIL and stops both the event loop
+     and the step thread. Recording `gc.callbacks` start and stop times and the generation would
+     show whether stalls coincide with generation-2 collections.
+   - **Growth of the CUDA caching allocator.** A step that needs more memory than the cache holds
+     calls `cudaMalloc`, which can block for tens of milliseconds. Logging each step's duration
+     next to `torch.cuda.memory_stats()` (reserved bytes, segment count, allocation retries)
+     would show whether long steps coincide with new segments.
+   - **A blocked event loop.** Synchronous work on the asyncio thread, such as tokenizing a burst
+     of prompts, delays every stream's SSE writes even when steps are on time. An event-loop lag
+     monitor (a periodic callback that records how late it runs), logged together with step start
+     and end times, would separate a slow step from slow delivery.
+
+   One log of (step start, step end, scheduled tokens, GC events, allocator stats, loop lag) per
+   step would distinguish the three.
+
 ## What this does not show
 
 - **One GPU and one small model.** With 0.6B parameters, per-step overhead is a large share of
